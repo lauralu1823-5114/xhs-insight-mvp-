@@ -3,6 +3,7 @@ from io import BytesIO
 
 import pandas as pd
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 import plotly.express as px
 
 
@@ -325,7 +326,7 @@ def get_secret_value(name: str, default=""):
     """从 Streamlit secrets 安全读取配置，未创建 secrets.toml 时返回默认值。"""
     try:
         return st.secrets.get(name, default)
-    except Exception:
+    except StreamlitSecretNotFoundError:
         return default
 
 
