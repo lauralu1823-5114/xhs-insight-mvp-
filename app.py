@@ -251,14 +251,23 @@ def default_insight(theme: str) -> dict:
     })
 
 
+def first_non_empty_value(series: pd.Series) -> str:
+    """安全获取一组数据中的第一个非空文本。"""
+    for value in series.dropna().astype(str):
+        value = value.strip()
+        if value:
+            return value
+    return ""
+
+
 def build_post_level_table(df: pd.DataFrame) -> pd.DataFrame:
     """把“多行评论”聚合成“每行一个帖子”。"""
     rows = []
 
     for post_id, group in df.groupby("post_id"):
-        title = group["标题_clean"].dropna().astype(str).iloc[0] if len(group) else ""
-        url = group["url"].dropna().astype(str).iloc[0] if "url" in group else ""
-        keyword = group["搜索关键词"].dropna().astype(str).iloc[0] if len(group) else ""
+        title = first_non_empty_value(group["标题_clean"]) if "标题_clean" in group else ""
+        url = first_non_empty_value(group["url"]) if "url" in group else ""
+        keyword = first_non_empty_value(group["搜索关键词"]) if "搜索关键词" in group else ""
         comments = [c for c in group["评论文本"].dropna().astype(str).tolist() if c.strip()]
         joined_comments = "\n".join(comments)
         all_text = f"{title}\n{joined_comments}"
