@@ -34,7 +34,7 @@ def load_sample_data() -> pd.DataFrame:
 
 
 def read_uploaded_file(uploaded_file) -> pd.DataFrame:
-    """支持 xlsx / csv 上传。"""
+    """支持 xlsx / xls / csv 上传。"""
     if uploaded_file is None:
         return load_sample_data()
 
@@ -251,14 +251,23 @@ def default_insight(theme: str) -> dict:
     })
 
 
+def first_non_empty_value(series: pd.Series) -> str:
+    """安全获取一组数据中的第一个非空文本。"""
+    for value in series.dropna().astype(str):
+        value = value.strip()
+        if value:
+            return value
+    return ""
+
+
 def build_post_level_table(df: pd.DataFrame) -> pd.DataFrame:
     """把“多行评论”聚合成“每行一个帖子”。"""
     rows = []
 
     for post_id, group in df.groupby("post_id"):
-        title = group["标题_clean"].dropna().astype(str).iloc[0] if len(group) else ""
-        url = group["url"].dropna().astype(str).iloc[0] if "url" in group else ""
-        keyword = group["搜索关键词"].dropna().astype(str).iloc[0] if len(group) else ""
+        title = first_non_empty_value(group["标题_clean"]) if "标题_clean" in group else ""
+        url = first_non_empty_value(group["url"]) if "url" in group else ""
+        keyword = first_non_empty_value(group["搜索关键词"]) if "搜索关键词" in group else ""
         comments = [c for c in group["评论文本"].dropna().astype(str).tolist() if c.strip()]
         joined_comments = "\n".join(comments)
         all_text = f"{title}\n{joined_comments}"
@@ -306,6 +315,170 @@ def build_post_level_table(df: pd.DataFrame) -> pd.DataFrame:
         result = result.sort_values("热度分", ascending=False).reset_index(drop=True)
     return result
 
+
+
+# =========================
+# AI 洞察增强
+# =========================
+
+def get_secret_value(name: str, default=""):
+    """从 Streamlit secrets 安全读取配置，未创建 secrets.toml 时返回默认值。"""
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+def is_ai_enabled() -> bool:
+    value = str(get_secret_value("ENABLE_AI_FEATURES", "false")).strip().lower()
+    return value in {"1", "true", "yes", "y", "on"}
+
+
+def get_ai_config() -> dict:
+    api_key = str(get_secret_value("ALIYUN_API_KEY", "")).strip()
+    base_url = str(get_secret_value("ALIYUN_BASE_URL", "")).strip()
+    model = str(get_secret_value("ALIYUN_TEXT_MODEL", "")).strip()
+    enabled = is_ai_enabled() and bool(api_key and base_url and model)
+    return {
+        "enabled": enabled,
+        "api_key": api_key,
+        "base_url": base_url,
+        "model": model,
+    }
+
+
+def get_ai_disabled_reason(config: dict) -> str:
+    if not is_ai_enabled():
+        return "未配置 AI，当前使用规则版分析。"
+    missing = []
+    if not config.get("api_key"):
+        missing.append("ALIYUN_API_KEY")
+    if not config.get("base_url"):
+        missing.append("ALIYUN_BASE_URL")
+    if not config.get("model"):
+        missing.append("ALIYUN_TEXT_MODEL")
+    if missing:
+        return f"未配置 AI，当前使用规则版分析。缺少：{', '.join(missing)}。"
+    return "未配置 AI，当前使用规则版分析。"
+
+
+def compact_text(value, max_chars: int = 4000) -> str:
+    text = "" if pd.isna(value) else str(value)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text) > max_chars:
+        return text[:max_chars] + "……"
+    return text
+
+
+def build_ai_source_context(row: pd.Series, brand_name: str, campaign_name: str) -> str:
+    comments = compact_text(row.get("全部高赞评论", ""), 5000)
+    return f"""
+品牌名称：{brand_name}
+项目名称：{campaign_name}
+搜索关键词：{row.get("搜索关键词", "")}
+笔记标题：{row.get("笔记标题", "")}
+笔记正文 / 内容链接中的可用文本：{row.get("内容链接", "")}
+高赞评论列表：
+{comments}
+
+现有规则版洞察主题：{row.get("洞察主题", "")}
+现有一句话洞察：{row.get("一句话洞察", "")}
+规则版品牌机会判断：{row.get("品牌能否自然下场", "")}
+规则版风险等级：{row.get("风险等级", "")}
+规则版二创方向：{row.get("二创方向", "")}
+""".strip()
+
+
+def call_aliyun_text_model(prompt: str, config: dict) -> str:
+    from openai import OpenAI
+
+    client = OpenAI(
+        api_key=config["api_key"],
+        base_url=config["base_url"],
+    )
+    response = client.chat.completions.create(
+        model=config["model"],
+        messages=[
+            {
+                "role": "system",
+                "content": "你是一位资深中国品牌策略同事，擅长从小红书内容与评论区中提炼春节营销洞察。请只使用中文输出，判断品牌怎么接才不尴尬，不要写空泛广告套话。",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.7,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def generate_ai_insight(row: pd.Series, brand_name: str, campaign_name: str, config: dict) -> str:
+    source_context = build_ai_source_context(row, brand_name, campaign_name)
+    prompt = f"""
+请基于以下单条小红书帖子和高赞评论，优化成更像资深品牌策略同事写出的洞察。请使用固定结构输出，每个标题都要保留。
+
+{source_context}
+
+输出要求：
+- 使用中文；
+- 适合中国品牌营销语境；
+- 像资深品牌策略同事，不要像数据分析师；
+- 不要写成空泛的广告套话；
+- 要判断“品牌怎么接才不尴尬”；
+- 可以结合伊利、春节、牛奶、家庭关系、送礼、日常陪伴等场景；
+- 但不要强行硬贴产品，不要输出过度说教的品牌口号。
+
+请按以下结构输出：
+## 评论区接住了什么
+## 高赞评论为什么成立
+## 一句话消费者洞察
+## 品牌机会判断
+## 品牌下场理由
+## 不建议硬接的原因
+## 风险提醒
+## 可转化为品牌内容的方向
+## 可二创 / 评论区互动方向
+## 给代理公司的 brief 任务提示
+""".strip()
+    return call_aliyun_text_model(prompt, config)
+
+
+def generate_ai_brief(row: pd.Series, brand_name: str, campaign_name: str, config: dict) -> str:
+    source_context = build_ai_source_context(row, brand_name, campaign_name)
+    prompt = f"""
+请基于以下单条小红书帖子、高赞评论和规则版洞察，生成更完整的品牌 brief 文本。请保留固定结构，并写得像资深品牌策略同事给代理公司的任务输入。
+
+{source_context}
+
+输出要求：
+- 使用中文；
+- 适合中国品牌营销语境；
+- 不要写成空泛广告套话；
+- 要判断品牌怎么接才不尴尬；
+- 可以结合伊利、春节、牛奶、家庭关系、送礼、日常陪伴等场景；
+- 不要强行硬贴产品，不要输出过度说教的品牌口号。
+
+请按以下结构输出：
+## 背景观察
+## 消费者洞察
+## 品牌机会
+## 创意任务
+## 必须避免
+## 可探索方向
+## 评论区互动机制
+## 参考消费者原话
+## 给代理公司的任务说明
+""".strip()
+    return call_aliyun_text_model(prompt, config)
+
+
+def render_ai_config_notice(config: dict):
+    st.caption("AI 功能会消耗阿里云百炼模型额度。建议先使用免费额度，并开启免费额度用完即停。")
+    if not config["enabled"]:
+        st.info(get_ai_disabled_reason(config))
+
+
+def render_ai_error(error: Exception):
+    st.error("AI 调用失败，请检查 API Key、Base URL、模型名、免费额度开关或网络状态。")
+    st.caption(f"错误信息：{type(error).__name__}: {compact_text(str(error), 500)}")
 
 # =========================
 # 页面组件
@@ -368,6 +541,8 @@ def generate_brief_text(row: pd.Series, brand_name: str, campaign_name: str) -> 
 
 st.title("🧧 Ivy 的小红书春节洞察工作台")
 st.caption("个人版 MVP：上传/使用春节洞察表 → 自动清洗评论 → 生成洞察主题、品牌机会判断、二创方向和 brief 素材。")
+st.info("这是一个帮助品牌经理从小红书春节内容和高赞评论中提炼消费者洞察、品牌机会、风险判断与 brief 素材的个人工作台。")
+ai_config = get_ai_config()
 
 with st.sidebar:
     st.header("项目设置")
@@ -375,6 +550,22 @@ with st.sidebar:
     campaign_name = st.text_input("项目名称", value="羊年春节营销")
     uploaded_file = st.file_uploader("上传你的 Excel / CSV", type=["xlsx", "xls", "csv"])
     use_sample = st.checkbox("没有上传时使用示例春节洞察库", value=True)
+
+    st.divider()
+    st.subheader("如何使用")
+    st.markdown(
+        """
+1. 第一步：上传 Excel / CSV 数据；
+2. 第二步：如果不上传，默认使用 `sample_data/spring_festival_sample.csv` 示例数据；
+3. 第三步：先看“数据预览”，确认数据是否读取成功；
+4. 第四步：再看“热点看板”“评论区洞察”“品牌机会”“Brief 素材”；
+5. 第五步：下载分析结果或复制 brief 文本。
+        """
+    )
+
+    st.divider()
+    st.subheader("AI 功能提示")
+    render_ai_config_notice(ai_config)
 
     st.divider()
     st.subheader("品牌判断原则")
@@ -483,6 +674,17 @@ with tab3:
 
         st.info(f"二创方向：{selected['二创方向']}")
 
+        st.divider()
+        st.subheader("AI 洞察增强")
+        render_ai_config_notice(ai_config)
+        if st.button("使用 AI 优化这条洞察", disabled=not ai_config["enabled"]):
+            with st.spinner("AI 正在优化这条洞察……"):
+                try:
+                    ai_insight = generate_ai_insight(selected, brand_name, campaign_name, ai_config)
+                    st.markdown(ai_insight)
+                except Exception as e:
+                    render_ai_error(e)
+
 
 with tab4:
     st.subheader("品牌机会判断")
@@ -523,6 +725,17 @@ with tab5:
             file_name="brief素材.txt",
             mime="text/plain",
         )
+
+        st.divider()
+        st.subheader("AI Brief 增强")
+        render_ai_config_notice(ai_config)
+        if st.button("使用 AI 生成更完整 brief", disabled=not ai_config["enabled"]):
+            with st.spinner("AI 正在生成更完整 brief……"):
+                try:
+                    ai_brief = generate_ai_brief(selected_2, brand_name, campaign_name, ai_config)
+                    st.markdown(ai_brief)
+                except Exception as e:
+                    render_ai_error(e)
 
 st.divider()
 st.caption("MVP 提醒：当前版本是基于规则的轻量分析器，不会自动抓取小红书数据。建议先用手动收集的小样本跑通判断框架，再考虑接入更复杂的数据源。")
