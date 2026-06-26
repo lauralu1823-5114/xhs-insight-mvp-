@@ -34,7 +34,7 @@ def load_sample_data() -> pd.DataFrame:
 
 
 def read_uploaded_file(uploaded_file) -> pd.DataFrame:
-    """支持 xlsx / csv 上传。"""
+    """支持 xlsx / xls / csv 上传。"""
     if uploaded_file is None:
         return load_sample_data()
 
@@ -251,14 +251,23 @@ def default_insight(theme: str) -> dict:
     })
 
 
+def first_non_empty_value(series: pd.Series) -> str:
+    """安全获取一组数据中的第一个非空文本。"""
+    for value in series.dropna().astype(str):
+        value = value.strip()
+        if value:
+            return value
+    return ""
+
+
 def build_post_level_table(df: pd.DataFrame) -> pd.DataFrame:
     """把“多行评论”聚合成“每行一个帖子”。"""
     rows = []
 
     for post_id, group in df.groupby("post_id"):
-        title = group["标题_clean"].dropna().astype(str).iloc[0] if len(group) else ""
-        url = group["url"].dropna().astype(str).iloc[0] if "url" in group else ""
-        keyword = group["搜索关键词"].dropna().astype(str).iloc[0] if len(group) else ""
+        title = first_non_empty_value(group["标题_clean"]) if "标题_clean" in group else ""
+        url = first_non_empty_value(group["url"]) if "url" in group else ""
+        keyword = first_non_empty_value(group["搜索关键词"]) if "搜索关键词" in group else ""
         comments = [c for c in group["评论文本"].dropna().astype(str).tolist() if c.strip()]
         joined_comments = "\n".join(comments)
         all_text = f"{title}\n{joined_comments}"
@@ -368,6 +377,7 @@ def generate_brief_text(row: pd.Series, brand_name: str, campaign_name: str) -> 
 
 st.title("🧧 Ivy 的小红书春节洞察工作台")
 st.caption("个人版 MVP：上传/使用春节洞察表 → 自动清洗评论 → 生成洞察主题、品牌机会判断、二创方向和 brief 素材。")
+st.info("这是一个帮助品牌经理从小红书春节内容和高赞评论中提炼消费者洞察、品牌机会、风险判断与 brief 素材的个人工作台。")
 
 with st.sidebar:
     st.header("项目设置")
@@ -375,6 +385,18 @@ with st.sidebar:
     campaign_name = st.text_input("项目名称", value="羊年春节营销")
     uploaded_file = st.file_uploader("上传你的 Excel / CSV", type=["xlsx", "xls", "csv"])
     use_sample = st.checkbox("没有上传时使用示例春节洞察库", value=True)
+
+    st.divider()
+    st.subheader("如何使用")
+    st.markdown(
+        """
+1. 第一步：上传 Excel / CSV 数据；
+2. 第二步：如果不上传，默认使用 `sample_data/spring_festival_sample.csv` 示例数据；
+3. 第三步：先看“数据预览”，确认数据是否读取成功；
+4. 第四步：再看“热点看板”“评论区洞察”“品牌机会”“Brief 素材”；
+5. 第五步：下载分析结果或复制 brief 文本。
+        """
+    )
 
     st.divider()
     st.subheader("品牌判断原则")
