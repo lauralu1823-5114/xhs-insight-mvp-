@@ -4,6 +4,7 @@ from io import BytesIO
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+from openai import OpenAI
 
 
 # =========================
@@ -21,6 +22,119 @@ REQUIRED_COLUMNS = [
     "高赞评论摘录", "评论内赞量", "评论内互动量",
     "二创潜力", "二创方向", "品牌能否自然下场", "一句话洞察"
 ]
+
+
+# =========================
+# AI 配置与调用
+# =========================
+
+AI_NOT_CONFIGURED_MESSAGE = "未配置 AI，当前使用规则版分析。"
+AI_ERROR_MESSAGE = "AI 调用失败，请检查 API Key、Base URL、模型名、免费额度开关或网络状态。"
+AI_COST_TIP = "AI 功能会消耗阿里云百炼模型额度。建议先使用免费额度，并开启免费额度用完即停。"
+
+
+def get_secret_value(name: str, default=None):
+    """从 Streamlit secrets 读取配置；未配置 secrets.toml 时保持静默降级。"""
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+def is_ai_enabled() -> bool:
+    value = get_secret_value("ENABLE_AI_FEATURES", False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def get_ai_config() -> dict:
+    config = {
+        "enabled": is_ai_enabled(),
+        "api_key": get_secret_value("ALIYUN_API_KEY", ""),
+        "base_url": get_secret_value("ALIYUN_BASE_URL", ""),
+        "model": get_secret_value("ALIYUN_TEXT_MODEL", ""),
+    }
+    config["available"] = all([config["enabled"], config["api_key"], config["base_url"], config["model"]])
+    return config
+
+
+def compact_comments(comments_text: str, limit: int = 12) -> str:
+    comments = [line.strip() for line in str(comments_text).splitlines() if line.strip()]
+    return "\n".join(f"- {comment}" for comment in comments[:limit])
+
+
+def post_context(row: pd.Series, brand_name: str, campaign_name: str) -> str:
+    return f"""
+当前品牌名称：{brand_name}
+当前项目名称：{campaign_name}
+搜索关键词：{row.get("搜索关键词", "")}
+笔记标题：{row.get("笔记标题", "")}
+笔记正文 / 内容链接中的可用文本：{row.get("内容链接", "")}
+高赞评论列表：
+{compact_comments(row.get("全部高赞评论", ""))}
+现有规则版洞察主题：{row.get("洞察主题", "")}
+现有一句话洞察：{row.get("一句话洞察", "")}
+规则版品牌机会判断：{row.get("品牌能否自然下场", "")}
+规则版风险等级：{row.get("风险等级", "")}
+规则版二创方向：{row.get("二创方向", "")}
+""".strip()
+
+
+def call_ai_model(system_prompt: str, user_prompt: str, config: dict) -> str:
+    client = OpenAI(api_key=config["api_key"], base_url=config["base_url"])
+    response = client.chat.completions.create(
+        model=config["model"],
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.65,
+    )
+    return response.choices[0].message.content or ""
+
+
+def generate_ai_insight(row: pd.Series, brand_name: str, campaign_name: str, config: dict) -> str:
+    system_prompt = "你是一位资深中国品牌策略同事，擅长从小红书春节内容和高赞评论里判断品牌怎么接才自然。请用中文输出，适合中国品牌营销语境。不要像数据分析师，不要写空泛广告套话，不要强行硬贴产品，不要输出过度说教的品牌口号。可以结合伊利、春节、牛奶、家庭关系、送礼、日常陪伴等场景，但必须克制、具体、有判断。"
+    user_prompt = f"""
+请基于以下材料，优化成一条更像资深品牌策略同事写出的洞察。
+
+{post_context(row, brand_name, campaign_name)}
+
+请严格使用以下 Markdown 结构输出，每个标题下给出具体判断：
+## 评论区接住了什么
+## 高赞评论为什么成立
+## 一句话消费者洞察
+## 品牌机会判断
+## 品牌下场理由
+## 不建议硬接的原因
+## 风险提醒
+## 可转化为品牌内容的方向
+## 可二创 / 评论区互动方向
+## 给代理公司的 brief 任务提示
+""".strip()
+    return call_ai_model(system_prompt, user_prompt, config)
+
+
+def generate_ai_brief(row: pd.Series, brand_name: str, campaign_name: str, config: dict) -> str:
+    system_prompt = "你是一位资深中国品牌策略与创意 brief 负责人。请把小红书帖子和评论区情绪转成给代理公司可执行的中文 brief。语气专业、具体、克制，判断品牌怎么接才不尴尬；不要空泛口号，不要强行硬贴产品。"
+    user_prompt = f"""
+请基于以下材料，生成更完整的 AI brief。
+
+{post_context(row, brand_name, campaign_name)}
+
+请严格使用以下 Markdown 结构输出：
+## 背景观察
+## 消费者洞察
+## 品牌机会
+## 创意任务
+## 必须避免
+## 可探索方向
+## 评论区互动机制
+## 参考消费者原话
+## 给代理公司的任务说明
+""".strip()
+    return call_ai_model(system_prompt, user_prompt, config)
 
 
 # =========================
@@ -387,6 +501,15 @@ with st.sidebar:
     use_sample = st.checkbox("没有上传时使用示例春节洞察库", value=True)
 
     st.divider()
+    ai_config = get_ai_config()
+    st.subheader("AI 功能")
+    st.caption(AI_COST_TIP)
+    if ai_config["available"]:
+        st.success("AI 洞察增强已启用。")
+    else:
+        st.info(AI_NOT_CONFIGURED_MESSAGE)
+
+    st.divider()
     st.subheader("如何使用")
     st.markdown(
         """
@@ -505,6 +628,23 @@ with tab3:
 
         st.info(f"二创方向：{selected['二创方向']}")
 
+        st.divider()
+        st.subheader("AI 洞察增强")
+        st.caption(AI_COST_TIP)
+        if not ai_config["available"]:
+            st.info(AI_NOT_CONFIGURED_MESSAGE)
+        if st.button("使用 AI 优化这条洞察", disabled=not ai_config["available"], key="ai_insight_button"):
+            try:
+                with st.spinner("AI 正在优化洞察..."):
+                    ai_insight_text = generate_ai_insight(selected, brand_name, campaign_name, ai_config)
+                st.session_state["ai_insight_text"] = ai_insight_text
+            except Exception as e:
+                st.error(AI_ERROR_MESSAGE)
+                st.caption(str(e)[:500])
+
+        if st.session_state.get("ai_insight_text"):
+            st.markdown(st.session_state["ai_insight_text"])
+
 
 with tab4:
     st.subheader("品牌机会判断")
@@ -545,6 +685,23 @@ with tab5:
             file_name="brief素材.txt",
             mime="text/plain",
         )
+
+        st.divider()
+        st.subheader("AI Brief 增强")
+        st.caption(AI_COST_TIP)
+        if not ai_config["available"]:
+            st.info(AI_NOT_CONFIGURED_MESSAGE)
+        if st.button("使用 AI 生成更完整 brief", disabled=not ai_config["available"], key="ai_brief_button"):
+            try:
+                with st.spinner("AI 正在生成 brief..."):
+                    ai_brief_text = generate_ai_brief(selected_2, brand_name, campaign_name, ai_config)
+                st.session_state["ai_brief_text"] = ai_brief_text
+            except Exception as e:
+                st.error(AI_ERROR_MESSAGE)
+                st.caption(str(e)[:500])
+
+        if st.session_state.get("ai_brief_text"):
+            st.markdown(st.session_state["ai_brief_text"])
 
 st.divider()
 st.caption("MVP 提醒：当前版本是基于规则的轻量分析器，不会自动抓取小红书数据。建议先用手动收集的小样本跑通判断框架，再考虑接入更复杂的数据源。")
