@@ -1,9 +1,13 @@
+import base64
+import json
 import re
 from io import BytesIO
 
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+from openai import OpenAI
+from PIL import Image
 
 
 # =========================
@@ -21,6 +25,300 @@ REQUIRED_COLUMNS = [
     "高赞评论摘录", "评论内赞量", "评论内互动量",
     "二创潜力", "二创方向", "品牌能否自然下场", "一句话洞察"
 ]
+
+
+# =========================
+# AI 配置与调用
+# =========================
+
+AI_NOT_CONFIGURED_MESSAGE = "未配置 AI，当前使用规则版分析。"
+VISION_NOT_CONFIGURED_MESSAGE = "未配置视觉模型，当前无法使用截图识别。"
+AI_ERROR_MESSAGE = "AI 调用失败，请检查 API Key、Base URL、模型名、免费额度开关或网络状态。"
+VISION_ERROR_MESSAGE = "截图识别失败，请检查 API Key、Base URL、视觉模型名、免费额度开关或图片大小。"
+AI_COST_TIP = "AI 功能会消耗阿里云百炼模型额度。建议先使用免费额度，并开启免费额度用完即停。"
+VISION_COST_TIP = "截图识别会消耗阿里云百炼视觉模型额度。建议先使用免费额度，并开启免费额度用完即停。每次建议上传 1-5 张截图。"
+
+
+def get_secret_value(name: str, default=None):
+    """从 Streamlit secrets 读取配置；未配置 secrets.toml 时保持静默降级。"""
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+def is_ai_enabled() -> bool:
+    value = get_secret_value("ENABLE_AI_FEATURES", False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def get_ai_config() -> dict:
+    config = {
+        "enabled": is_ai_enabled(),
+        "api_key": get_secret_value("ALIYUN_API_KEY", ""),
+        "base_url": get_secret_value("ALIYUN_BASE_URL", ""),
+        "model": get_secret_value("ALIYUN_TEXT_MODEL", ""),
+    }
+    config["available"] = all([config["enabled"], config["api_key"], config["base_url"], config["model"]])
+    return config
+
+
+def get_vision_config() -> dict:
+    config = {
+        "enabled": is_ai_enabled(),
+        "api_key": get_secret_value("ALIYUN_API_KEY", ""),
+        "base_url": get_secret_value("ALIYUN_BASE_URL", ""),
+        "model": get_secret_value("ALIYUN_VISION_MODEL", ""),
+        "text_model": get_secret_value("ALIYUN_TEXT_MODEL", ""),
+    }
+    config["available"] = all([config["enabled"], config["api_key"], config["base_url"], config["model"]])
+    return config
+
+
+def compact_comments(comments_text: str, limit: int = 12) -> str:
+    comments = [line.strip() for line in str(comments_text).splitlines() if line.strip()]
+    return "\n".join(f"- {comment}" for comment in comments[:limit])
+
+
+def post_context(row: pd.Series, brand_name: str, campaign_name: str) -> str:
+    return f"""
+当前品牌名称：{brand_name}
+当前项目名称：{campaign_name}
+搜索关键词：{row.get("搜索关键词", "")}
+笔记标题：{row.get("笔记标题", "")}
+笔记正文 / 内容链接中的可用文本：{row.get("内容链接", "")}
+高赞评论列表：
+{compact_comments(row.get("全部高赞评论", ""))}
+现有规则版洞察主题：{row.get("洞察主题", "")}
+现有一句话洞察：{row.get("一句话洞察", "")}
+规则版品牌机会判断：{row.get("品牌能否自然下场", "")}
+规则版风险等级：{row.get("风险等级", "")}
+规则版二创方向：{row.get("二创方向", "")}
+""".strip()
+
+
+def call_ai_model(system_prompt: str, user_prompt: str, config: dict) -> str:
+    client = OpenAI(api_key=config["api_key"], base_url=config["base_url"])
+    response = client.chat.completions.create(
+        model=config["model"],
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.65,
+    )
+    return response.choices[0].message.content or ""
+
+
+def generate_ai_insight(row: pd.Series, brand_name: str, campaign_name: str, config: dict) -> str:
+    system_prompt = "你是一位资深中国品牌策略同事，擅长从小红书春节内容和高赞评论里判断品牌怎么接才自然。请用中文输出，适合中国品牌营销语境。不要像数据分析师，不要写空泛广告套话，不要强行硬贴产品，不要输出过度说教的品牌口号。可以结合伊利、春节、牛奶、家庭关系、送礼、日常陪伴等场景，但必须克制、具体、有判断。"
+    user_prompt = f"""
+请基于以下材料，优化成一条更像资深品牌策略同事写出的洞察。
+
+{post_context(row, brand_name, campaign_name)}
+
+请严格使用以下 Markdown 结构输出，每个标题下给出具体判断：
+## 评论区接住了什么
+## 高赞评论为什么成立
+## 一句话消费者洞察
+## 品牌机会判断
+## 品牌下场理由
+## 不建议硬接的原因
+## 风险提醒
+## 可转化为品牌内容的方向
+## 可二创 / 评论区互动方向
+## 给代理公司的 brief 任务提示
+""".strip()
+    return call_ai_model(system_prompt, user_prompt, config)
+
+
+def generate_ai_brief(row: pd.Series, brand_name: str, campaign_name: str, config: dict) -> str:
+    system_prompt = "你是一位资深中国品牌策略与创意 brief 负责人。请把小红书帖子和评论区情绪转成给代理公司可执行的中文 brief。语气专业、具体、克制，判断品牌怎么接才不尴尬；不要空泛口号，不要强行硬贴产品。"
+    user_prompt = f"""
+请基于以下材料，生成更完整的 AI brief。
+
+{post_context(row, brand_name, campaign_name)}
+
+请严格使用以下 Markdown 结构输出：
+## 背景观察
+## 消费者洞察
+## 品牌机会
+## 创意任务
+## 必须避免
+## 可探索方向
+## 评论区互动机制
+## 参考消费者原话
+## 给代理公司的任务说明
+""".strip()
+    return call_ai_model(system_prompt, user_prompt, config)
+
+
+def compress_image_to_data_url(uploaded_file, max_side: int = 1600, quality: int = 85) -> str:
+    """把上传截图压缩成可传给 OpenAI-compatible 视觉模型的 data URL，不落盘保存原图。"""
+    image = Image.open(uploaded_file)
+    image = image.convert("RGB")
+    image.thumbnail((max_side, max_side))
+
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=quality, optimize=True)
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def extract_json_from_text(text: str):
+    """容错解析模型返回：优先直接解析 JSON，失败后尝试提取首个 JSON 片段。"""
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+
+    try:
+        return json.loads(raw), raw
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"(\{[\s\S]*\})", raw)
+    if match:
+        candidate = match.group(1)
+        try:
+            return json.loads(candidate), raw
+        except json.JSONDecodeError:
+            return None, raw
+
+    return None, raw
+
+
+def call_vision_model(
+    uploaded_files,
+    keyword: str,
+    manual_link: str,
+    extra_note: str,
+    brand_name: str,
+    campaign_name: str,
+    config: dict,
+) -> dict:
+    image_parts = [
+        {"type": "image_url", "image_url": {"url": compress_image_to_data_url(file)}}
+        for file in uploaded_files
+    ]
+
+    prompt = f"""
+你正在帮助品牌/市场营销经理识别用户主动上传的小红书截图。请不要访问链接，不要抓取网页，不要编造截图中没有的信息。
+
+请完成两步任务，并只输出一个严格 JSON 对象，不要输出 Markdown，不要输出解释文字。
+
+第一步：从截图中提取结构化信息。字段如下：
+{{
+  "搜索关键词": "",
+  "内容链接": "",
+  "笔记标题": "",
+  "笔记正文": "",
+  "作者昵称": "",
+  "作者类型": "",
+  "发布时间": "",
+  "点赞数": "",
+  "收藏数": "",
+  "评论数": "",
+  "分享数": "",
+  "高赞评论列表": [
+    {{"评论文本": "", "点赞数": "", "评论者昵称": ""}}
+  ],
+  "截图识别备注": ""
+}}
+如果截图中没有某项信息，请填空字符串，不要编造。
+
+第二步：基于识别出的帖子内容和高赞评论，生成品牌洞察初稿。字段如下：
+{{
+  "评论区接住了什么": "",
+  "高赞评论为什么成立": "",
+  "一句话消费者洞察": "",
+  "品牌机会判断": "",
+  "品牌下场理由": "",
+  "不建议硬接的原因": "",
+  "风险提醒": "",
+  "可转化为品牌内容的方向": "",
+  "可二创/评论区互动方向": "",
+  "给代理公司的brief任务提示": ""
+}}
+
+输出语气要求：使用中文；适合中国品牌营销语境；像资深品牌策略同事，不要像数据分析师；不要写空泛广告套话；要判断“品牌怎么接才不尴尬”；可以结合伊利、春节、牛奶、家庭关系、送礼、日常陪伴等场景；但不要强行硬贴产品，不要输出过度说教的品牌口号。
+
+用户补充信息：
+- 搜索关键词：{keyword}
+- 内容链接：{manual_link}
+- 补充说明：{extra_note}
+- 品牌名称：{brand_name}
+- 项目名称：{campaign_name}
+
+最终 JSON 顶层结构必须是：
+{{
+  "帖子信息": {{...第一步字段...}},
+  "AI洞察初稿": {{...第二步字段...}}
+}}
+""".strip()
+
+    client = OpenAI(api_key=config["api_key"], base_url=config["base_url"])
+    response = client.chat.completions.create(
+        model=config["model"],
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    *image_parts,
+                ],
+            }
+        ],
+        temperature=0.2,
+    )
+    raw_text = response.choices[0].message.content or ""
+    parsed, raw = extract_json_from_text(raw_text)
+    return {"parsed": parsed, "raw": raw}
+
+
+def screenshot_result_to_dataframe(result: dict, keyword: str, manual_link: str) -> pd.DataFrame:
+    post = result.get("帖子信息", result) or {}
+    comments = post.get("高赞评论列表") or []
+    if not isinstance(comments, list):
+        comments = []
+
+    title = post.get("笔记标题", "")
+    body = post.get("笔记正文", "")
+    link = manual_link or post.get("内容链接", "")
+    search_keyword = keyword or post.get("搜索关键词", "")
+    interaction = (
+        f"{post.get('点赞数', '')}赞 "
+        f"{post.get('收藏数', '')}收藏 "
+        f"{post.get('评论数', '')}评论 "
+        f"{post.get('分享数', '')}分享"
+    ).strip()
+
+    rows = []
+    if not comments:
+        comments = [{"评论文本": body, "点赞数": "", "评论者昵称": ""}]
+
+    for idx, comment in enumerate(comments):
+        comment = comment if isinstance(comment, dict) else {"评论文本": str(comment), "点赞数": "", "评论者昵称": ""}
+        rows.append({
+            "编号": f"截图识别-{pd.Timestamp.utcnow().strftime('%Y%m%d%H%M%S')}" if idx == 0 else None,
+            "搜索关键词": search_keyword if idx == 0 else None,
+            "内容链接": link if idx == 0 else None,
+            "笔记标题": title if idx == 0 else None,
+            "作者类型": post.get("作者类型", "") if idx == 0 else None,
+            "发布时间": post.get("发布时间", "") if idx == 0 else None,
+            "高赞评论摘录": comment.get("评论文本", ""),
+            "评论内赞量": comment.get("点赞数", ""),
+            "评论内互动量": interaction if idx == 0 else None,
+            "二创潜力": None,
+            "二创方向": None,
+            "品牌能否自然下场": None,
+            "一句话洞察": None,
+            "截图识别备注": post.get("截图识别备注", "") if idx == 0 else None,
+        })
+
+    return pd.DataFrame(rows)
 
 
 # =========================
@@ -379,6 +677,9 @@ st.title("🧧 Ivy 的小红书春节洞察工作台")
 st.caption("个人版 MVP：上传/使用春节洞察表 → 自动清洗评论 → 生成洞察主题、品牌机会判断、二创方向和 brief 素材。")
 st.info("这是一个帮助品牌经理从小红书春节内容和高赞评论中提炼消费者洞察、品牌机会、风险判断与 brief 素材的个人工作台。")
 
+if "screenshot_library_df" not in st.session_state:
+    st.session_state["screenshot_library_df"] = pd.DataFrame()
+
 with st.sidebar:
     st.header("项目设置")
     brand_name = st.text_input("品牌名称", value="伊利")
@@ -387,14 +688,29 @@ with st.sidebar:
     use_sample = st.checkbox("没有上传时使用示例春节洞察库", value=True)
 
     st.divider()
+    ai_config = get_ai_config()
+    vision_config = get_vision_config()
+    st.subheader("AI 功能")
+    st.caption(AI_COST_TIP)
+    if ai_config["available"]:
+        st.success("AI 洞察增强已启用。")
+    else:
+        st.info(AI_NOT_CONFIGURED_MESSAGE)
+    if vision_config["available"]:
+        st.success("截图识别已启用。")
+    else:
+        st.info(VISION_NOT_CONFIGURED_MESSAGE)
+
+    st.divider()
     st.subheader("如何使用")
     st.markdown(
         """
 1. 第一步：上传 Excel / CSV 数据；
 2. 第二步：如果不上传，默认使用 `sample_data/spring_festival_sample.csv` 示例数据；
 3. 第三步：先看“数据预览”，确认数据是否读取成功；
-4. 第四步：再看“热点看板”“评论区洞察”“品牌机会”“Brief 素材”；
-5. 第五步：下载分析结果或复制 brief 文本。
+4. 第四步：可在“截图识别”上传小红书截图并加入当前洞察库；
+5. 第五步：再看“热点看板”“评论区洞察”“品牌机会”“Brief 素材”；
+6. 第六步：下载分析结果或复制 brief 文本。
         """
     )
 
@@ -412,7 +728,9 @@ try:
         st.info("请先上传 Excel/CSV，或在侧边栏勾选使用示例数据。")
         st.stop()
 
-    raw_df = read_uploaded_file(uploaded_file)
+    base_df = read_uploaded_file(uploaded_file)
+    screenshot_df = st.session_state.get("screenshot_library_df", pd.DataFrame())
+    raw_df = pd.concat([base_df, screenshot_df], ignore_index=True) if not screenshot_df.empty else base_df
     clean_df = clean_dataframe(raw_df)
     post_df = build_post_level_table(clean_df)
 
@@ -422,8 +740,9 @@ except Exception as e:
     st.stop()
 
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📥 数据预览",
+    "📸 截图识别",
     "📊 热点看板",
     "💬 评论区洞察",
     "🎯 品牌机会",
@@ -445,6 +764,112 @@ with tab1:
 
 
 with tab2:
+    st.subheader("📸 截图识别")
+    st.caption(VISION_COST_TIP)
+    st.info("适合上传小红书笔记正文截图、评论区截图、高赞评论截图。视频类内容建议补充一句话描述，因为当前版本不会自动访问小红书链接或播放视频。")
+    st.warning("合规边界：本功能只分析用户主动上传的截图；不会访问小红书链接、不会抓取网页、不会下载或播放视频，也不会把截图保存到 GitHub。")
+
+    screenshot_files = st.file_uploader(
+        "上传截图（建议每次 1-5 张）",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        key="screenshot_uploader",
+    )
+    screenshot_keyword = st.text_input("搜索关键词（可选）", value="春节", key="screenshot_keyword")
+    screenshot_link = st.text_input("内容链接（可选）", value="", key="screenshot_link")
+    screenshot_note = st.text_area("补充说明（可选）", value="", key="screenshot_note")
+    screenshot_brand = st.text_input("品牌名称", value=brand_name, key="screenshot_brand")
+    screenshot_campaign = st.text_input("项目名称", value=campaign_name, key="screenshot_campaign")
+
+    if not vision_config["available"]:
+        st.info(VISION_NOT_CONFIGURED_MESSAGE)
+    if screenshot_files and len(screenshot_files) > 5:
+        st.warning("建议每次上传 1-5 张截图；当前会继续尝试压缩后识别，但图片过多可能导致调用失败。")
+
+    if st.button("识别截图并生成洞察", disabled=not vision_config["available"] or not screenshot_files):
+        try:
+            with st.spinner("正在识别截图并生成洞察..."):
+                vision_result = call_vision_model(
+                    screenshot_files,
+                    screenshot_keyword,
+                    screenshot_link,
+                    screenshot_note,
+                    screenshot_brand,
+                    screenshot_campaign,
+                    vision_config,
+                )
+            st.session_state["vision_result"] = vision_result
+        except Exception as e:
+            st.error(VISION_ERROR_MESSAGE)
+            st.caption(str(e)[:500])
+
+    vision_result = st.session_state.get("vision_result")
+    if vision_result:
+        parsed = vision_result.get("parsed")
+        if not parsed:
+            st.warning("模型返回的 JSON 不规范，已展示原始输出。你可以手动复制有用内容。")
+            st.text_area("原始模型输出", vision_result.get("raw", ""), height=260)
+        else:
+            post_info = parsed.get("帖子信息", parsed)
+            ai_draft = parsed.get("AI洞察初稿", {})
+            comments = post_info.get("高赞评论列表") or []
+            comments_df = pd.DataFrame(comments) if isinstance(comments, list) else pd.DataFrame()
+            structured_df = screenshot_result_to_dataframe(parsed, screenshot_keyword, screenshot_link)
+
+            st.divider()
+            st.markdown("### A. 识别出的帖子信息")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.write(f"**笔记标题：** {post_info.get('笔记标题', '')}")
+                st.write(f"**作者昵称：** {post_info.get('作者昵称', '')}")
+                st.write(f"**内容链接：** {post_info.get('内容链接', '') or screenshot_link}")
+            with c2:
+                st.write(
+                    "**互动数据：** "
+                    f"点赞 {post_info.get('点赞数', '')} / "
+                    f"收藏 {post_info.get('收藏数', '')} / "
+                    f"评论 {post_info.get('评论数', '')} / "
+                    f"分享 {post_info.get('分享数', '')}"
+                )
+                st.write(f"**截图识别备注：** {post_info.get('截图识别备注', '')}")
+            st.write("**笔记正文：**")
+            st.write(post_info.get("笔记正文", ""))
+
+            st.markdown("### B. 识别出的高赞评论")
+            if comments_df.empty:
+                st.info("未识别到高赞评论。")
+            else:
+                st.dataframe(comments_df, use_container_width=True, height=240)
+
+            st.markdown("### C. AI 洞察初稿")
+            for label in [
+                "评论区接住了什么",
+                "一句话消费者洞察",
+                "品牌机会判断",
+                "风险提醒",
+                "可转化为品牌内容的方向",
+                "给代理公司的brief任务提示",
+            ]:
+                st.markdown(f"**{label}**")
+                st.write(ai_draft.get(label, ""))
+
+            col_join, col_download = st.columns(2)
+            with col_join:
+                if st.button("加入当前洞察库"):
+                    existing = st.session_state.get("screenshot_library_df", pd.DataFrame())
+                    st.session_state["screenshot_library_df"] = pd.concat([existing, structured_df], ignore_index=True)
+                    st.success("已加入当前洞察库。页面将刷新并参与数据预览、热点看板、评论区洞察、品牌机会和 Brief 素材。")
+                    st.rerun()
+            with col_download:
+                st.download_button(
+                    "下载截图识别结果 CSV",
+                    data=structured_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="截图识别结果.csv",
+                    mime="text/csv",
+                )
+
+
+with tab3:
     st.subheader("春节热点概览")
 
     col1, col2, col3, col4 = st.columns(4)
@@ -486,7 +911,7 @@ with tab2:
         st.plotly_chart(fig, use_container_width=True)
 
 
-with tab3:
+with tab4:
     st.subheader("评论区洞察卡片")
     st.caption("这里优先看“高赞评论接住了什么”，不是只看笔记标题。")
 
@@ -505,8 +930,25 @@ with tab3:
 
         st.info(f"二创方向：{selected['二创方向']}")
 
+        st.divider()
+        st.subheader("AI 洞察增强")
+        st.caption(AI_COST_TIP)
+        if not ai_config["available"]:
+            st.info(AI_NOT_CONFIGURED_MESSAGE)
+        if st.button("使用 AI 优化这条洞察", disabled=not ai_config["available"], key="ai_insight_button"):
+            try:
+                with st.spinner("AI 正在优化洞察..."):
+                    ai_insight_text = generate_ai_insight(selected, brand_name, campaign_name, ai_config)
+                st.session_state["ai_insight_text"] = ai_insight_text
+            except Exception as e:
+                st.error(AI_ERROR_MESSAGE)
+                st.caption(str(e)[:500])
 
-with tab4:
+        if st.session_state.get("ai_insight_text"):
+            st.markdown(st.session_state["ai_insight_text"])
+
+
+with tab5:
     st.subheader("品牌机会判断")
     st.caption("这部分更像策略同事给你的初筛：能不能接、怎么接、风险是什么。")
 
@@ -528,7 +970,7 @@ with tab4:
     )
 
 
-with tab5:
+with tab6:
     st.subheader("一键生成 Brief 素材")
     if post_df.empty:
         st.warning("暂无可生成 brief 的数据。")
@@ -545,6 +987,23 @@ with tab5:
             file_name="brief素材.txt",
             mime="text/plain",
         )
+
+        st.divider()
+        st.subheader("AI Brief 增强")
+        st.caption(AI_COST_TIP)
+        if not ai_config["available"]:
+            st.info(AI_NOT_CONFIGURED_MESSAGE)
+        if st.button("使用 AI 生成更完整 brief", disabled=not ai_config["available"], key="ai_brief_button"):
+            try:
+                with st.spinner("AI 正在生成 brief..."):
+                    ai_brief_text = generate_ai_brief(selected_2, brand_name, campaign_name, ai_config)
+                st.session_state["ai_brief_text"] = ai_brief_text
+            except Exception as e:
+                st.error(AI_ERROR_MESSAGE)
+                st.caption(str(e)[:500])
+
+        if st.session_state.get("ai_brief_text"):
+            st.markdown(st.session_state["ai_brief_text"])
 
 st.divider()
 st.caption("MVP 提醒：当前版本是基于规则的轻量分析器，不会自动抓取小红书数据。建议先用手动收集的小样本跑通判断框架，再考虑接入更复杂的数据源。")
