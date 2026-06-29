@@ -36,7 +36,8 @@ AI_NOT_CONFIGURED_MESSAGE = "未配置 AI，当前使用规则版分析。"
 AI_ERROR_MESSAGE = "AI 调用失败，请检查 API Key、Base URL、模型名、免费额度开关或网络状态。"
 AI_COST_TIP = "AI 功能会消耗阿里云百炼模型额度。建议先使用免费额度，并开启免费额度用完即停。"
 VISION_NOT_CONFIGURED_MESSAGE = "未配置视觉模型，当前无法使用截图识别。"
-VISION_ERROR_MESSAGE = "截图识别失败，请检查 API Key、Base URL、视觉模型名、免费额度开关或图片大小。"
+VISION_ERROR_MESSAGE = "截图识别失败，请检查视觉模型配置（API Key、Base URL、视觉模型名、免费额度开关）或图片大小。"
+TEXT_INSIGHT_ERROR_MESSAGE = "AI 洞察生成失败，请检查文本模型配置（ALIYUN_TEXT_MODEL、API Key、Base URL、免费额度开关）或网络状态。"
 VISION_COST_TIP = "截图识别会消耗阿里云百炼视觉模型额度。建议先使用免费额度，并开启免费额度用完即停。每次建议上传 1-5 张截图。"
 
 
@@ -164,7 +165,7 @@ def generate_ai_brief(row: pd.Series, brand_name: str, campaign_name: str, confi
 
 SCREENSHOT_STRUCT_FIELDS = [
     "搜索关键词", "内容链接", "笔记标题", "笔记正文", "作者昵称", "作者类型", "发布时间",
-    "点赞数", "收藏数", "评论数", "分享数", "高赞评论列表", "截图识别备注"
+    "点赞数", "收藏数", "评论数", "分享数", "高赞评论列表", "补充说明", "截图识别备注", "识别置信度", "可能不确定字段"
 ]
 
 SCREENSHOT_INSIGHT_FIELDS = [
@@ -210,29 +211,29 @@ def parse_json_from_model_output(text: str):
         return None
 
 
-def normalize_screenshot_result(parsed: dict, keyword: str, manual_link: str) -> dict:
-    """兼容模型返回扁平 JSON 或 {截图结构化识别, 品牌洞察初稿} 两种形态。"""
+def normalize_screenshot_result(parsed: dict, keyword: str, manual_link: str, note: str = "") -> dict:
+    """兼容模型返回扁平 JSON 或旧版嵌套 JSON；V1.2.1 只保留 OCR 结构化结果。"""
     parsed = parsed or {}
     structured = parsed.get("截图结构化识别") or parsed.get("结构化信息") or parsed.get("post") or parsed
-    insight = parsed.get("品牌洞察初稿") or parsed.get("品牌洞察") or parsed.get("insight") or {}
 
     structured = {field: structured.get(field, "") for field in SCREENSHOT_STRUCT_FIELDS}
     structured["搜索关键词"] = structured.get("搜索关键词") or keyword or "春节"
     structured["内容链接"] = manual_link or structured.get("内容链接", "")
+    structured["补充说明"] = note or structured.get("补充说明", "")
     comments = structured.get("高赞评论列表")
     structured["高赞评论列表"] = comments if isinstance(comments, list) else []
+    if isinstance(structured.get("可能不确定字段"), list):
+        structured["可能不确定字段"] = "、".join(str(item) for item in structured["可能不确定字段"] if item)
 
-    insight = {field: insight.get(field, "") for field in SCREENSHOT_INSIGHT_FIELDS}
-    return {"截图结构化识别": structured, "品牌洞察初稿": insight}
+    return {"截图结构化识别": structured, "品牌洞察初稿": {field: "" for field in SCREENSHOT_INSIGHT_FIELDS}}
 
 
 def build_screenshot_prompt(keyword: str, manual_link: str, note: str, brand_name: str, campaign_name: str) -> str:
     return f"""
 你将看到用户主动上传的小红书笔记正文截图、评论区截图或高赞评论截图。请不要访问链接、不要抓取网页、不要假设截图之外的信息。
 
-请完成两步：
-1. 从截图中提取结构化信息；截图里没有的字段填空字符串，不要编造。
-2. 基于帖子内容和高赞评论，生成品牌洞察初稿。
+请只完成 OCR 和结构化识别：从截图中提取结构化信息；截图里没有的字段填空字符串，不要编造。
+不要生成品牌洞察、品牌机会、创意建议或营销判断。
 
 用户补充信息：
 - 搜索关键词：{keyword or '春节'}
@@ -241,7 +242,7 @@ def build_screenshot_prompt(keyword: str, manual_link: str, note: str, brand_nam
 - 品牌名称：{brand_name}
 - 项目名称：{campaign_name}
 
-输出要求：只输出严格 JSON，不要输出 Markdown，不要加解释。JSON 顶层必须包含“截图结构化识别”和“品牌洞察初稿”。字段如下：
+输出要求：只输出严格 JSON，不要输出 Markdown，不要加解释。JSON 顶层只包含“截图结构化识别”。字段如下：
 {{
   "截图结构化识别": {{
     "搜索关键词": "",
@@ -256,23 +257,13 @@ def build_screenshot_prompt(keyword: str, manual_link: str, note: str, brand_nam
     "评论数": "",
     "分享数": "",
     "高赞评论列表": [{{"评论文本": "", "点赞数": "", "评论者昵称": ""}}],
-    "截图识别备注": ""
-  }},
-  "品牌洞察初稿": {{
-    "评论区接住了什么": "",
-    "高赞评论为什么成立": "",
-    "一句话消费者洞察": "",
-    "品牌机会判断": "",
-    "品牌下场理由": "",
-    "不建议硬接的原因": "",
-    "风险提醒": "",
-    "可转化为品牌内容的方向": "",
-    "可二创/评论区互动方向": "",
-    "给代理公司的brief任务提示": ""
+    "截图识别备注": "",
+    "识别置信度": "",
+    "可能不确定字段": ""
   }}
 }}
 
-语气要求：使用中文，适合中国品牌营销语境，像资深品牌策略同事；不要空泛广告套话；要判断品牌怎么接才不尴尬；可以结合春节、牛奶、家庭关系、送礼、日常陪伴等场景，但不要强行硬贴产品，不要输出过度说教的品牌口号。
+识别要求：高赞评论必须尽量逐条 OCR；看不清就写入“可能不确定字段”和“截图识别备注”。不要因为评论少而补写不存在的评论。
 """.strip()
 
 
@@ -290,6 +281,59 @@ def call_vision_model(uploaded_images, keyword: str, manual_link: str, note: str
     )
     return response.choices[0].message.content or ""
 
+
+
+def build_confirmed_screenshot_insight_prompt(structured: dict, brand_name: str, campaign_name: str) -> str:
+    comments = structured.get("高赞评论列表") or []
+    comment_lines = []
+    for idx, comment in enumerate(comments, start=1):
+        if isinstance(comment, dict):
+            text = comment.get("评论文本", "")
+            likes = comment.get("点赞数", "")
+            nickname = comment.get("评论者昵称", "")
+            comment_lines.append(f"{idx}. {text}（赞：{likes}；评论者：{nickname}）")
+        else:
+            comment_lines.append(f"{idx}. {comment}")
+    sample_warning = "评论样本较少，洞察仅供初筛。" if len([c for c in comment_lines if c.strip()]) < 3 else ""
+    return f"""
+请基于用户已确认/编辑过的截图识别结果，输出像资深品牌策略同事的判断。
+
+品牌名称：{brand_name}
+项目名称：{campaign_name}
+搜索关键词：{structured.get('搜索关键词', '')}
+内容链接：{structured.get('内容链接', '')}
+笔记标题：{structured.get('笔记标题', '')}
+笔记正文：{structured.get('笔记正文', '')}
+作者昵称：{structured.get('作者昵称', '')}
+作者类型：{structured.get('作者类型', '')}
+发布时间：{structured.get('发布时间', '')}
+互动数据：点赞 {structured.get('点赞数', '')} / 收藏 {structured.get('收藏数', '')} / 评论 {structured.get('评论数', '')} / 分享 {structured.get('分享数', '')}
+高赞评论：
+{chr(10).join(comment_lines) or '（未识别到高赞评论）'}
+补充说明：{structured.get('补充说明', '')}
+{sample_warning}
+
+必须重点回答：评论区到底接住了什么情绪/欲望/生活想象；高赞评论为什么会被赞；这条内容背后的消费者洞察是什么；伊利/牛奶作为春节品牌能不能自然下场；怎么接才不尴尬；哪些方向不要碰；能给代理公司什么创意任务。
+
+不要泛化：如果评论较少或评论信息不足，必须明确提示“评论样本较少，洞察仅供初筛”，不要编造复杂结论。不要输出“增强情感连接”“打造春节氛围”“结合节日元素”等空泛内容，除非能具体说明来自哪条评论或正文。
+
+请严格使用以下 Markdown 结构输出：
+## 评论区接住了什么
+## 高赞评论为什么成立
+## 一句话消费者洞察
+## 品牌机会判断
+## 品牌下场理由
+## 不建议硬接的原因
+## 风险提醒
+## 可转化为品牌内容的方向
+## 可二创/评论区互动方向
+## 给代理公司的 brief 任务提示
+""".strip()
+
+
+def generate_confirmed_screenshot_insight(structured: dict, brand_name: str, campaign_name: str, config: dict) -> str:
+    system_prompt = "你是一位资深中国品牌策略同事。你只基于用户确认过的标题、正文、高赞评论和补充说明做判断；证据不足就明确说不足。请用中文输出，具体、克制、有取舍，不写空泛广告套话，不强行硬贴产品。"
+    return call_ai_model(system_prompt, build_confirmed_screenshot_insight_prompt(structured, brand_name, campaign_name), config)
 
 def screenshot_result_to_dataframe(result: dict) -> pd.DataFrame:
     structured = result.get("截图结构化识别", {})
@@ -837,7 +881,7 @@ with tab3:
             st.warning("请先上传至少一张截图。")
         else:
             try:
-                with st.spinner("视觉模型正在识别截图并生成洞察..."):
+                with st.spinner("视觉模型正在进行 OCR 和结构化识别..."):
                     raw_output = call_vision_model(
                         screenshot_files,
                         screenshot_keyword,
@@ -853,7 +897,7 @@ with tab3:
                     st.session_state.pop("screenshot_result", None)
                     st.warning("模型返回的 JSON 不规范，已展示原始输出。你可以手动复制其中有用内容。")
                 else:
-                    st.session_state["screenshot_result"] = normalize_screenshot_result(parsed, screenshot_keyword, screenshot_link)
+                    st.session_state["screenshot_result"] = normalize_screenshot_result(parsed, screenshot_keyword, screenshot_link, screenshot_note)
                     st.session_state.pop("screenshot_raw_output", None)
             except Exception as e:
                 st.error(VISION_ERROR_MESSAGE)
@@ -865,25 +909,94 @@ with tab3:
     result = st.session_state.get("screenshot_result")
     if result:
         structured = result["截图结构化识别"]
-        insight = result["品牌洞察初稿"]
-        result_df = screenshot_result_to_dataframe(result)
 
         st.divider()
-        st.markdown("### A. 识别出的帖子信息")
-        st.write(f"**笔记标题：** {structured.get('笔记标题', '')}")
-        st.write(f"**笔记正文：** {structured.get('笔记正文', '')}")
-        st.write(f"**作者昵称：** {structured.get('作者昵称', '')}")
-        st.write(f"**内容链接：** {structured.get('内容链接', '')}")
-        st.write(f"**互动数据：** 点赞 {structured.get('点赞数', '')} ｜ 收藏 {structured.get('收藏数', '')} ｜ 评论 {structured.get('评论数', '')} ｜ 分享 {structured.get('分享数', '')}")
-        st.write(f"**截图识别备注：** {structured.get('截图识别备注', '')}")
+        st.markdown("### A. OCR 识别结果确认 / 编辑区")
+        st.warning("截图识别可能有误，建议先确认标题、正文和高赞评论，再生成 AI 洞察。")
 
-        st.markdown("### B. 识别出的高赞评论")
-        st.dataframe(pd.DataFrame(structured.get("高赞评论列表", [])), use_container_width=True, height=240)
+        with st.form("screenshot_confirm_form"):
+            col_title, col_link = st.columns(2)
+            with col_title:
+                edited_title = st.text_input("笔记标题", value=structured.get("笔记标题", ""))
+                edited_author = st.text_input("作者昵称", value=structured.get("作者昵称", ""))
+                edited_author_type = st.text_input("作者类型", value=structured.get("作者类型", ""))
+                edited_publish_time = st.text_input("发布时间", value=structured.get("发布时间", ""))
+            with col_link:
+                edited_link = st.text_input("内容链接", value=structured.get("内容链接", ""))
+                edited_likes = st.text_input("点赞数", value=structured.get("点赞数", ""))
+                edited_collects = st.text_input("收藏数", value=structured.get("收藏数", ""))
+                edited_comment_count = st.text_input("评论数", value=structured.get("评论数", ""))
+                edited_shares = st.text_input("分享数", value=structured.get("分享数", ""))
 
-        st.markdown("### C. AI 洞察初稿")
-        for label in ["评论区接住了什么", "一句话消费者洞察", "品牌机会判断", "风险提醒", "可转化为品牌内容的方向", "给代理公司的brief任务提示"]:
-            st.markdown(f"**{label}**\n\n{insight.get(label, '') or '（模型未识别到可用内容）'}")
+            edited_body = st.text_area("笔记正文", value=structured.get("笔记正文", ""), height=140)
+            edited_note = st.text_area("补充说明", value=structured.get("补充说明", ""), height=90)
 
+            st.markdown("#### 高赞评论文本与评论点赞数")
+            comments_df = pd.DataFrame(structured.get("高赞评论列表", []))
+            if comments_df.empty:
+                comments_df = pd.DataFrame([{ "评论文本": "", "点赞数": "", "评论者昵称": "" }])
+            for col in ["评论文本", "点赞数", "评论者昵称"]:
+                if col not in comments_df.columns:
+                    comments_df[col] = ""
+            edited_comments_df = st.data_editor(
+                comments_df[["评论文本", "点赞数", "评论者昵称"]],
+                num_rows="dynamic",
+                use_container_width=True,
+                key="screenshot_comments_editor",
+            )
+
+            st.caption(f"识别置信度：{structured.get('识别置信度', '') or '未提供'} ｜ 可能不确定字段：{structured.get('可能不确定字段', '') or '未提供'}")
+            st.caption(f"截图识别备注：{structured.get('截图识别备注', '') or '无'}")
+
+            save_confirmed = st.form_submit_button("保存确认内容")
+
+        if save_confirmed:
+            confirmed = dict(structured)
+            confirmed.update({
+                "笔记标题": edited_title,
+                "笔记正文": edited_body,
+                "内容链接": edited_link,
+                "作者昵称": edited_author,
+                "作者类型": edited_author_type,
+                "发布时间": edited_publish_time,
+                "点赞数": edited_likes,
+                "收藏数": edited_collects,
+                "评论数": edited_comment_count,
+                "分享数": edited_shares,
+                "补充说明": edited_note,
+                "高赞评论列表": [
+                    {
+                        "评论文本": str(row.get("评论文本", "")).strip(),
+                        "点赞数": str(row.get("点赞数", "")).strip(),
+                        "评论者昵称": str(row.get("评论者昵称", "")).strip(),
+                    }
+                    for _, row in edited_comments_df.fillna("").iterrows()
+                    if str(row.get("评论文本", "")).strip() or str(row.get("点赞数", "")).strip()
+                ],
+            })
+            st.session_state["screenshot_result"] = {"截图结构化识别": confirmed, "品牌洞察初稿": result.get("品牌洞察初稿", {})}
+            st.success("已保存确认内容。")
+            st.rerun()
+
+        structured = st.session_state["screenshot_result"]["截图结构化识别"]
+        text_config = get_ai_config()
+        if not text_config["available"]:
+            st.info("未配置文本模型，当前无法基于确认内容生成 AI 洞察。")
+
+        if st.button("基于确认内容生成 AI 洞察", disabled=not text_config["available"]):
+            try:
+                with st.spinner("文本模型正在基于确认内容生成 AI 洞察..."):
+                    insight_markdown = generate_confirmed_screenshot_insight(structured, screenshot_brand, screenshot_campaign, text_config)
+                st.session_state["screenshot_insight_markdown"] = insight_markdown
+            except Exception as e:
+                st.error(TEXT_INSIGHT_ERROR_MESSAGE)
+                st.caption(str(e)[:500])
+
+        if st.session_state.get("screenshot_insight_markdown"):
+            st.markdown("### B. AI 洞察结果")
+            st.markdown(st.session_state["screenshot_insight_markdown"])
+
+        result_df = screenshot_result_to_dataframe(st.session_state["screenshot_result"])
         col_join, col_download = st.columns(2)
         with col_join:
             if st.button("加入当前洞察库"):
