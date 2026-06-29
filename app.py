@@ -1,3 +1,5 @@
+import base64
+import json
 import re
 from io import BytesIO
 
@@ -5,6 +7,7 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 from openai import OpenAI
+from PIL import Image
 
 
 # =========================
@@ -20,7 +23,8 @@ st.set_page_config(
 REQUIRED_COLUMNS = [
     "编号", "搜索关键词", "内容链接", "笔记标题", "作者类型", "发布时间",
     "高赞评论摘录", "评论内赞量", "评论内互动量",
-    "二创潜力", "二创方向", "品牌能否自然下场", "一句话洞察"
+    "二创潜力", "二创方向", "品牌能否自然下场", "一句话洞察",
+    "截图识别备注"
 ]
 
 
@@ -31,6 +35,9 @@ REQUIRED_COLUMNS = [
 AI_NOT_CONFIGURED_MESSAGE = "未配置 AI，当前使用规则版分析。"
 AI_ERROR_MESSAGE = "AI 调用失败，请检查 API Key、Base URL、模型名、免费额度开关或网络状态。"
 AI_COST_TIP = "AI 功能会消耗阿里云百炼模型额度。建议先使用免费额度，并开启免费额度用完即停。"
+VISION_NOT_CONFIGURED_MESSAGE = "未配置视觉模型，当前无法使用截图识别。"
+VISION_ERROR_MESSAGE = "截图识别失败，请检查 API Key、Base URL、视觉模型名、免费额度开关或图片大小。"
+VISION_COST_TIP = "截图识别会消耗阿里云百炼视觉模型额度。建议先使用免费额度，并开启免费额度用完即停。每次建议上传 1-5 张截图。"
 
 
 def get_secret_value(name: str, default=None):
@@ -54,6 +61,18 @@ def get_ai_config() -> dict:
         "api_key": get_secret_value("ALIYUN_API_KEY", ""),
         "base_url": get_secret_value("ALIYUN_BASE_URL", ""),
         "model": get_secret_value("ALIYUN_TEXT_MODEL", ""),
+    }
+    config["available"] = all([config["enabled"], config["api_key"], config["base_url"], config["model"]])
+    return config
+
+
+def get_vision_config() -> dict:
+    config = {
+        "enabled": is_ai_enabled(),
+        "api_key": get_secret_value("ALIYUN_API_KEY", ""),
+        "base_url": get_secret_value("ALIYUN_BASE_URL", ""),
+        "model": get_secret_value("ALIYUN_VISION_MODEL", ""),
+        "text_model": get_secret_value("ALIYUN_TEXT_MODEL", ""),
     }
     config["available"] = all([config["enabled"], config["api_key"], config["base_url"], config["model"]])
     return config
@@ -135,6 +154,175 @@ def generate_ai_brief(row: pd.Series, brand_name: str, campaign_name: str, confi
 ## 给代理公司的任务说明
 """.strip()
     return call_ai_model(system_prompt, user_prompt, config)
+
+
+
+
+# =========================
+# V1.2 截图识别工具函数
+# =========================
+
+SCREENSHOT_STRUCT_FIELDS = [
+    "搜索关键词", "内容链接", "笔记标题", "笔记正文", "作者昵称", "作者类型", "发布时间",
+    "点赞数", "收藏数", "评论数", "分享数", "高赞评论列表", "截图识别备注"
+]
+
+SCREENSHOT_INSIGHT_FIELDS = [
+    "评论区接住了什么", "高赞评论为什么成立", "一句话消费者洞察", "品牌机会判断", "品牌下场理由",
+    "不建议硬接的原因", "风险提醒", "可转化为品牌内容的方向", "可二创/评论区互动方向", "给代理公司的brief任务提示"
+]
+
+
+def image_to_data_url(uploaded_image, max_side: int = 1600, quality: int = 82) -> str:
+    """压缩上传截图并转为 data URL；仅在当前会话内存中处理，不落盘。"""
+    uploaded_image.seek(0)
+    image = Image.open(uploaded_image)
+    image = image.convert("RGB")
+    image.thumbnail((max_side, max_side))
+    output = BytesIO()
+    image.save(output, format="JPEG", quality=quality, optimize=True)
+    encoded = base64.b64encode(output.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def parse_json_from_model_output(text: str):
+    """容错解析模型输出：先直接解析，再抽取首尾 JSON 片段。"""
+    if not text:
+        return None
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    start_candidates = [i for i in [cleaned.find("{"), cleaned.find("[")] if i >= 0]
+    if not start_candidates:
+        return None
+    start = min(start_candidates)
+    end = max(cleaned.rfind("}"), cleaned.rfind("]"))
+    if end <= start:
+        return None
+    try:
+        return json.loads(cleaned[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def normalize_screenshot_result(parsed: dict, keyword: str, manual_link: str) -> dict:
+    """兼容模型返回扁平 JSON 或 {截图结构化识别, 品牌洞察初稿} 两种形态。"""
+    parsed = parsed or {}
+    structured = parsed.get("截图结构化识别") or parsed.get("结构化信息") or parsed.get("post") or parsed
+    insight = parsed.get("品牌洞察初稿") or parsed.get("品牌洞察") or parsed.get("insight") or {}
+
+    structured = {field: structured.get(field, "") for field in SCREENSHOT_STRUCT_FIELDS}
+    structured["搜索关键词"] = structured.get("搜索关键词") or keyword or "春节"
+    structured["内容链接"] = manual_link or structured.get("内容链接", "")
+    comments = structured.get("高赞评论列表")
+    structured["高赞评论列表"] = comments if isinstance(comments, list) else []
+
+    insight = {field: insight.get(field, "") for field in SCREENSHOT_INSIGHT_FIELDS}
+    return {"截图结构化识别": structured, "品牌洞察初稿": insight}
+
+
+def build_screenshot_prompt(keyword: str, manual_link: str, note: str, brand_name: str, campaign_name: str) -> str:
+    return f"""
+你将看到用户主动上传的小红书笔记正文截图、评论区截图或高赞评论截图。请不要访问链接、不要抓取网页、不要假设截图之外的信息。
+
+请完成两步：
+1. 从截图中提取结构化信息；截图里没有的字段填空字符串，不要编造。
+2. 基于帖子内容和高赞评论，生成品牌洞察初稿。
+
+用户补充信息：
+- 搜索关键词：{keyword or '春节'}
+- 手动补充内容链接：{manual_link or ''}
+- 补充说明：{note or ''}
+- 品牌名称：{brand_name}
+- 项目名称：{campaign_name}
+
+输出要求：只输出严格 JSON，不要输出 Markdown，不要加解释。JSON 顶层必须包含“截图结构化识别”和“品牌洞察初稿”。字段如下：
+{{
+  "截图结构化识别": {{
+    "搜索关键词": "",
+    "内容链接": "",
+    "笔记标题": "",
+    "笔记正文": "",
+    "作者昵称": "",
+    "作者类型": "",
+    "发布时间": "",
+    "点赞数": "",
+    "收藏数": "",
+    "评论数": "",
+    "分享数": "",
+    "高赞评论列表": [{{"评论文本": "", "点赞数": "", "评论者昵称": ""}}],
+    "截图识别备注": ""
+  }},
+  "品牌洞察初稿": {{
+    "评论区接住了什么": "",
+    "高赞评论为什么成立": "",
+    "一句话消费者洞察": "",
+    "品牌机会判断": "",
+    "品牌下场理由": "",
+    "不建议硬接的原因": "",
+    "风险提醒": "",
+    "可转化为品牌内容的方向": "",
+    "可二创/评论区互动方向": "",
+    "给代理公司的brief任务提示": ""
+  }}
+}}
+
+语气要求：使用中文，适合中国品牌营销语境，像资深品牌策略同事；不要空泛广告套话；要判断品牌怎么接才不尴尬；可以结合春节、牛奶、家庭关系、送礼、日常陪伴等场景，但不要强行硬贴产品，不要输出过度说教的品牌口号。
+""".strip()
+
+
+def call_vision_model(uploaded_images, keyword: str, manual_link: str, note: str, brand_name: str, campaign_name: str, config: dict) -> str:
+    client = OpenAI(api_key=config["api_key"], base_url=config["base_url"])
+    content = [{"type": "text", "text": build_screenshot_prompt(keyword, manual_link, note, brand_name, campaign_name)}]
+    for uploaded_image in uploaded_images:
+        content.append({"type": "image_url", "image_url": {"url": image_to_data_url(uploaded_image)}})
+
+    response = client.chat.completions.create(
+        model=config["model"],
+        messages=[{"role": "user", "content": content}],
+        temperature=0.2,
+        response_format={"type": "json_object"},
+    )
+    return response.choices[0].message.content or ""
+
+
+def screenshot_result_to_dataframe(result: dict) -> pd.DataFrame:
+    structured = result.get("截图结构化识别", {})
+    comments = structured.get("高赞评论列表") or [{"评论文本": "", "点赞数": "", "评论者昵称": ""}]
+    rows = []
+    interaction = "\n".join([
+        f"{structured.get('点赞数', '')}赞" if structured.get("点赞数") else "",
+        f"{structured.get('收藏数', '')}收藏" if structured.get("收藏数") else "",
+        f"{structured.get('评论数', '')}评论" if structured.get("评论数") else "",
+        f"{structured.get('分享数', '')}分享" if structured.get("分享数") else "",
+    ]).strip()
+
+    for idx, comment in enumerate(comments):
+        rows.append({
+            "编号": "截图识别" if idx == 0 else None,
+            "搜索关键词": structured.get("搜索关键词", "") if idx == 0 else None,
+            "内容链接": structured.get("内容链接", "") if idx == 0 else None,
+            "笔记标题": structured.get("笔记标题", "") if idx == 0 else None,
+            "作者类型": structured.get("作者类型", "") if idx == 0 else None,
+            "发布时间": structured.get("发布时间", "") if idx == 0 else None,
+            "高赞评论摘录": comment.get("评论文本", "") if isinstance(comment, dict) else str(comment),
+            "评论内赞量": comment.get("点赞数", "") if isinstance(comment, dict) else "",
+            "评论内互动量": interaction if idx == 0 else None,
+            "二创潜力": None,
+            "二创方向": None,
+            "品牌能否自然下场": None,
+            "一句话洞察": None,
+            "截图识别备注": structured.get("截图识别备注", "") if idx == 0 else None,
+            "作者昵称": structured.get("作者昵称", "") if idx == 0 else None,
+            "笔记正文": structured.get("笔记正文", "") if idx == 0 else None,
+            "评论者昵称": comment.get("评论者昵称", "") if isinstance(comment, dict) else "",
+        })
+    return pd.DataFrame(rows)
 
 
 # =========================
@@ -531,11 +719,14 @@ with st.sidebar:
     st.write("✅ 能自然连接送礼/早餐/家庭/日常秩序")
 
 try:
-    if uploaded_file is None and not use_sample:
+    screenshot_library_df = st.session_state.get("screenshot_library_df")
+    if uploaded_file is None and not use_sample and (screenshot_library_df is None or screenshot_library_df.empty):
         st.info("请先上传 Excel/CSV，或在侧边栏勾选使用示例数据。")
         st.stop()
 
-    raw_df = read_uploaded_file(uploaded_file)
+    raw_df = read_uploaded_file(uploaded_file) if (uploaded_file is not None or use_sample) else pd.DataFrame()
+    if screenshot_library_df is not None and not screenshot_library_df.empty:
+        raw_df = pd.concat([raw_df, screenshot_library_df], ignore_index=True, sort=False)
     clean_df = clean_dataframe(raw_df)
     post_df = build_post_level_table(clean_df)
 
@@ -545,8 +736,9 @@ except Exception as e:
     st.stop()
 
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab3, tab2, tab4, tab5, tab6 = st.tabs([
     "📥 数据预览",
+    "📸 截图识别",
     "📊 热点看板",
     "💬 评论区洞察",
     "🎯 品牌机会",
@@ -610,6 +802,105 @@ with tab2:
 
 
 with tab3:
+    st.subheader("📸 截图识别分析")
+    st.info("适合上传小红书笔记正文截图、评论区截图、高赞评论截图。视频类内容建议补充一句话描述，因为当前版本不会自动访问小红书链接或播放视频。")
+    st.warning(VISION_COST_TIP)
+    st.caption("合规边界：本功能只分析用户主动上传的截图；不会自动访问小红书链接、抓取网页、下载/播放视频或保存原图。")
+
+    vision_config = get_vision_config()
+    if not vision_config["available"]:
+        st.info(VISION_NOT_CONFIGURED_MESSAGE)
+
+    with st.form("screenshot_ocr_form"):
+        screenshot_files = st.file_uploader(
+            "上传截图（建议每次 1-5 张）",
+            type=["png", "jpg", "jpeg"],
+            accept_multiple_files=True,
+        )
+        col_a, col_b = st.columns(2)
+        with col_a:
+            screenshot_keyword = st.text_input("搜索关键词（可选）", value="春节")
+            screenshot_brand = st.text_input("品牌名称", value=brand_name)
+        with col_b:
+            screenshot_link = st.text_input("内容链接（可选）", value="")
+            screenshot_campaign = st.text_input("项目名称", value=campaign_name)
+        screenshot_note = st.text_area("补充说明（可选）", placeholder="例如：这是一条视频笔记，主要内容是……", height=90)
+        recognize_clicked = st.form_submit_button("开始截图识别", disabled=not vision_config["available"])
+
+    if not screenshot_files:
+        st.caption("请上传 png / jpg / jpeg 截图后开始识别；未上传截图时不会调用视觉模型。")
+    elif len(screenshot_files) > 5:
+        st.warning("建议每次上传 1-5 张截图。当前仍会尝试压缩后识别，如失败请减少图片数量。")
+
+    if recognize_clicked:
+        if not screenshot_files:
+            st.warning("请先上传至少一张截图。")
+        else:
+            try:
+                with st.spinner("视觉模型正在识别截图并生成洞察..."):
+                    raw_output = call_vision_model(
+                        screenshot_files,
+                        screenshot_keyword,
+                        screenshot_link,
+                        screenshot_note,
+                        screenshot_brand,
+                        screenshot_campaign,
+                        vision_config,
+                    )
+                parsed = parse_json_from_model_output(raw_output)
+                if parsed is None:
+                    st.session_state["screenshot_raw_output"] = raw_output
+                    st.session_state.pop("screenshot_result", None)
+                    st.warning("模型返回的 JSON 不规范，已展示原始输出。你可以手动复制其中有用内容。")
+                else:
+                    st.session_state["screenshot_result"] = normalize_screenshot_result(parsed, screenshot_keyword, screenshot_link)
+                    st.session_state.pop("screenshot_raw_output", None)
+            except Exception as e:
+                st.error(VISION_ERROR_MESSAGE)
+                st.caption(str(e)[:500])
+
+    if st.session_state.get("screenshot_raw_output"):
+        st.text_area("原始模型输出（JSON 解析失败时展示）", st.session_state["screenshot_raw_output"], height=260)
+
+    result = st.session_state.get("screenshot_result")
+    if result:
+        structured = result["截图结构化识别"]
+        insight = result["品牌洞察初稿"]
+        result_df = screenshot_result_to_dataframe(result)
+
+        st.divider()
+        st.markdown("### A. 识别出的帖子信息")
+        st.write(f"**笔记标题：** {structured.get('笔记标题', '')}")
+        st.write(f"**笔记正文：** {structured.get('笔记正文', '')}")
+        st.write(f"**作者昵称：** {structured.get('作者昵称', '')}")
+        st.write(f"**内容链接：** {structured.get('内容链接', '')}")
+        st.write(f"**互动数据：** 点赞 {structured.get('点赞数', '')} ｜ 收藏 {structured.get('收藏数', '')} ｜ 评论 {structured.get('评论数', '')} ｜ 分享 {structured.get('分享数', '')}")
+        st.write(f"**截图识别备注：** {structured.get('截图识别备注', '')}")
+
+        st.markdown("### B. 识别出的高赞评论")
+        st.dataframe(pd.DataFrame(structured.get("高赞评论列表", [])), use_container_width=True, height=240)
+
+        st.markdown("### C. AI 洞察初稿")
+        for label in ["评论区接住了什么", "一句话消费者洞察", "品牌机会判断", "风险提醒", "可转化为品牌内容的方向", "给代理公司的brief任务提示"]:
+            st.markdown(f"**{label}**\n\n{insight.get(label, '') or '（模型未识别到可用内容）'}")
+
+        col_join, col_download = st.columns(2)
+        with col_join:
+            if st.button("加入当前洞察库"):
+                existing = st.session_state.get("screenshot_library_df")
+                st.session_state["screenshot_library_df"] = pd.concat([existing, result_df], ignore_index=True, sort=False) if existing is not None else result_df
+                st.success("已加入当前洞察库。页面将重新运行，截图识别内容会参与数据预览、热点看板、评论区洞察、品牌机会和 Brief 素材。")
+                st.rerun()
+        with col_download:
+            st.download_button(
+                label="下载截图识别结果 CSV",
+                data=result_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name="截图识别结果.csv",
+                mime="text/csv",
+            )
+
+
+with tab4:
     st.subheader("评论区洞察卡片")
     st.caption("这里优先看“高赞评论接住了什么”，不是只看笔记标题。")
 
@@ -646,7 +937,7 @@ with tab3:
             st.markdown(st.session_state["ai_insight_text"])
 
 
-with tab4:
+with tab5:
     st.subheader("品牌机会判断")
     st.caption("这部分更像策略同事给你的初筛：能不能接、怎么接、风险是什么。")
 
@@ -668,7 +959,7 @@ with tab4:
     )
 
 
-with tab5:
+with tab6:
     st.subheader("一键生成 Brief 素材")
     if post_df.empty:
         st.warning("暂无可生成 brief 的数据。")

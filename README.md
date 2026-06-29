@@ -98,3 +98,15 @@ streamlit run app.py
 3. 加入历史记录保存，形成个人洞察库
 4. 加入导出 Word/PPT 大纲
 5. 再考虑接入 AI API，让每条洞察更像资深策略同事写的
+
+## V1.2 截图识别测试记录
+
+当前 PR 合并前已补充基础测试：
+
+- `python -m py_compile app.py`：通过，语法检查无报错。
+- `python app.py`：通过，未配置 Streamlit secrets / 视觉模型时 App 在 bare mode 下不会崩溃。
+- `streamlit.testing.v1.AppTest.from_file("app.py").run(timeout=20)`：通过，未配置视觉模型时可正常渲染，并显示截图识别不可用提示；未上传截图时，“📸 截图识别”页面可正常显示上传提示；V1.1 AI 洞察增强入口仍在原页面中。
+- CSV / XLSX 示例读写检查：通过，示例数据字段与上传兼容；`.xls` 读取依赖 `xlrd` 已在 `requirements.txt` 中声明。
+- API Key 检查：通过，代码中只读取 `ALIYUN_API_KEY` 等 secrets 名称，没有写入真实 API Key。
+
+如需真实调用截图识别，请在 Streamlit secrets 中配置 `ENABLE_AI_FEATURES=true`、`ALIYUN_API_KEY`、`ALIYUN_BASE_URL` 和 `ALIYUN_VISION_MODEL`。
