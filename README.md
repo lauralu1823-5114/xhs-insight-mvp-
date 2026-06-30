@@ -110,3 +110,29 @@ streamlit run app.py
 - API Key 检查：通过，代码中只读取 `ALIYUN_API_KEY` 等 secrets 名称，没有写入真实 API Key。
 
 如需真实调用截图识别，请在 Streamlit secrets 中配置 `ENABLE_AI_FEATURES=true`、`ALIYUN_API_KEY`、`ALIYUN_BASE_URL` 和 `ALIYUN_VISION_MODEL`。
+
+## V1.3 Monica 高级洞察模型接入
+
+推荐使用方式：
+
+- 阿里云百炼视觉模型继续负责截图识别 / OCR，请配置 `ALIYUN_API_KEY`、`ALIYUN_BASE_URL`、`ALIYUN_VISION_MODEL`，并保持 `ENABLE_AI_FEATURES=true`。
+- Monica 文本模型负责高级洞察、AI Brief 增强，以及截图识别确认后的品牌策略洞察。
+- 如果 Monica 未配置或 `USE_MONICA_FOR_INSIGHT` 缺失，系统会自动回退到阿里云百炼文本模型。
+- 如果 Monica 和阿里云文本模型都不可用，系统继续使用规则版分析，上传、示例数据、看板、截图确认、下载等功能不受影响。
+
+Streamlit Secrets 示例：
+
+```toml
+ENABLE_AI_FEATURES = true
+ALIYUN_API_KEY = "你的阿里云百炼 API Key"
+ALIYUN_BASE_URL = "你的阿里云 OpenAI-compatible Base URL"
+ALIYUN_TEXT_MODEL = "你的阿里云文本模型"
+ALIYUN_VISION_MODEL = "你的阿里云视觉模型"
+
+USE_MONICA_FOR_INSIGHT = true
+MONICA_API_KEY = "你的 Monica API Key"
+MONICA_BASE_URL = "https://openapi.monica.im/v1"
+MONICA_TEXT_MODEL = "gpt-4o"
+```
+
+注意：`MONICA_BASE_URL` 只需要填写到 `/v1`，不要填写 `/chat/completions`。Monica API 会按模型和 token 单独计费，请注意用量；如果 Monica 调用失败，请检查 API Key、Base URL、模型名、账户余额、额度限制或网络状态。
