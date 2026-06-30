@@ -41,10 +41,12 @@ POST_LEVEL_COLUMNS = [
 
 AI_NOT_CONFIGURED_MESSAGE = "未配置 AI，当前使用规则版分析。"
 AI_ERROR_MESSAGE = "AI 调用失败，请检查 API Key、Base URL、模型名、免费额度开关或网络状态。"
-AI_COST_TIP = "AI 功能会消耗阿里云百炼模型额度。建议先使用免费额度，并开启免费额度用完即停。"
+MONICA_ERROR_MESSAGE = "Monica 调用失败，请检查 API Key、Base URL、模型名、账户余额、额度限制或网络状态。"
+ALIYUN_TEXT_ERROR_MESSAGE = "阿里云百炼调用失败，请检查 API Key、Base URL、模型名、免费额度开关或网络状态。"
+AI_COST_TIP = "高级洞察会优先使用 Monica 文本模型；未配置 Monica 时回退到阿里云百炼文本模型，全部不可用时使用规则版分析。"
 VISION_NOT_CONFIGURED_MESSAGE = "未配置视觉模型，当前无法使用截图识别。"
 VISION_ERROR_MESSAGE = "截图识别失败，请检查视觉模型配置（API Key、Base URL、视觉模型名、免费额度开关）或图片大小。"
-TEXT_INSIGHT_ERROR_MESSAGE = "AI 洞察生成失败，请检查文本模型配置（ALIYUN_TEXT_MODEL、API Key、Base URL、免费额度开关）或网络状态。"
+TEXT_INSIGHT_ERROR_MESSAGE = "AI 洞察生成失败，请检查 Monica 或阿里云文本模型配置、额度或网络状态。"
 VISION_COST_TIP = "截图识别会消耗阿里云百炼视觉模型额度。建议先使用免费额度，并开启免费额度用完即停。每次建议上传 1-5 张截图。"
 
 
@@ -63,15 +65,49 @@ def is_ai_enabled() -> bool:
     return bool(value)
 
 
+def is_monica_insight_enabled() -> bool:
+    value = get_secret_value("USE_MONICA_FOR_INSIGHT", False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
 def get_ai_config() -> dict:
     config = {
+        "provider": "aliyun",
         "enabled": is_ai_enabled(),
         "api_key": get_secret_value("ALIYUN_API_KEY", ""),
         "base_url": get_secret_value("ALIYUN_BASE_URL", ""),
         "model": get_secret_value("ALIYUN_TEXT_MODEL", ""),
     }
     config["available"] = all([config["enabled"], config["api_key"], config["base_url"], config["model"]])
+    config["disabled_reason"] = "" if config["available"] else "阿里云文本模型配置不完整或 AI 功能未启用。"
     return config
+
+
+def get_insight_model_config() -> dict:
+    if not is_ai_enabled():
+        return {"provider": "rule", "api_key": "", "base_url": "", "model": "", "available": False, "disabled_reason": "ENABLE_AI_FEATURES=false，当前使用规则版分析。", "use_monica": is_monica_insight_enabled()}
+
+    use_monica = is_monica_insight_enabled()
+    monica_config = {
+        "provider": "monica",
+        "api_key": get_secret_value("MONICA_API_KEY", ""),
+        "base_url": get_secret_value("MONICA_BASE_URL", "https://openapi.monica.im/v1"),
+        "model": get_secret_value("MONICA_TEXT_MODEL", "gpt-4o"),
+        "use_monica": use_monica,
+    }
+    monica_available = all([monica_config["api_key"], monica_config["base_url"], monica_config["model"]])
+    if use_monica and monica_available:
+        return {**monica_config, "available": True, "disabled_reason": ""}
+
+    aliyun_config = get_ai_config()
+    if aliyun_config["available"]:
+        reason = "Monica 未启用。" if not use_monica else "Monica 配置不完整，已回退到阿里云百炼文本模型。"
+        return {**aliyun_config, "provider": "aliyun", "use_monica": use_monica, "disabled_reason": reason}
+
+    reason = "Monica 未启用，且阿里云文本模型不可用。" if not use_monica else "Monica 配置不完整，且阿里云文本模型不可用。"
+    return {"provider": "rule", "api_key": "", "base_url": "", "model": "", "available": False, "disabled_reason": reason, "use_monica": use_monica}
 
 
 def get_vision_config() -> dict:
@@ -108,25 +144,41 @@ def post_context(row: pd.Series, brand_name: str, campaign_name: str) -> str:
 """.strip()
 
 
+def call_insight_text_model(system_prompt: str, user_prompt: str, config: dict) -> str:
+    if config.get("provider") == "rule" or not config.get("available"):
+        return ""
+    try:
+        client = OpenAI(api_key=config["api_key"], base_url=config["base_url"])
+        response = client.chat.completions.create(
+            model=config["model"],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.65,
+        )
+        return response.choices[0].message.content or ""
+    except Exception as exc:
+        if config.get("provider") == "monica":
+            raise RuntimeError(MONICA_ERROR_MESSAGE) from exc
+        raise RuntimeError(ALIYUN_TEXT_ERROR_MESSAGE) from exc
+
+
 def call_ai_model(system_prompt: str, user_prompt: str, config: dict) -> str:
-    client = OpenAI(api_key=config["api_key"], base_url=config["base_url"])
-    response = client.chat.completions.create(
-        model=config["model"],
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.65,
-    )
-    return response.choices[0].message.content or ""
+    return call_insight_text_model(system_prompt, user_prompt, config)
 
 
 def generate_ai_insight(row: pd.Series, brand_name: str, campaign_name: str, config: dict) -> str:
-    system_prompt = "你是一位资深中国品牌策略同事，擅长从小红书春节内容和高赞评论里判断品牌怎么接才自然。请用中文输出，适合中国品牌营销语境。不要像数据分析师，不要写空泛广告套话，不要强行硬贴产品，不要输出过度说教的品牌口号。可以结合伊利、春节、牛奶、家庭关系、送礼、日常陪伴等场景，但必须克制、具体、有判断。"
+    comments_count = len([line for line in str(row.get("全部高赞评论", "")).splitlines() if line.strip()])
+    sample_warning = "评论样本较少，洞察仅供初筛。" if comments_count < 3 else ""
+    system_prompt = "你是一位资深中国品牌策略同事，擅长从小红书春节内容和高赞评论里判断品牌怎么接才自然。请用中文输出，适合中国品牌营销语境。必须像策略同事一样给出取舍、证据和风险，不要像数据分析师，不要写‘增强情感连接’‘打造节日氛围’‘结合春节元素’这类空泛套话，不要强行硬贴产品，不要把品牌机会写成广告口号。"
     user_prompt = f"""
 请基于以下材料，优化成一条更像资深品牌策略同事写出的洞察。
 
 {post_context(row, brand_name, campaign_name)}
+{sample_warning}
+
+重点判断：评论区到底接住了什么情绪/欲望/生活想象；高赞评论为什么会被赞；背后的消费者洞察；伊利/牛奶作为春节品牌能不能自然下场、怎么接才不尴尬；哪些方向不要碰；风险是什么；可以给代理公司什么创意任务；哪些内容可以变成小红书话题、评论区互动或二创机制。
 
 请严格使用以下 Markdown 结构输出，每个标题下给出具体判断：
 ## 评论区接住了什么
@@ -144,11 +196,16 @@ def generate_ai_insight(row: pd.Series, brand_name: str, campaign_name: str, con
 
 
 def generate_ai_brief(row: pd.Series, brand_name: str, campaign_name: str, config: dict) -> str:
-    system_prompt = "你是一位资深中国品牌策略与创意 brief 负责人。请把小红书帖子和评论区情绪转成给代理公司可执行的中文 brief。语气专业、具体、克制，判断品牌怎么接才不尴尬；不要空泛口号，不要强行硬贴产品。"
+    comments_count = len([line for line in str(row.get("全部高赞评论", "")).splitlines() if line.strip()])
+    sample_warning = "评论样本较少，洞察仅供初筛。" if comments_count < 3 else ""
+    system_prompt = "你是一位资深中国品牌策略与创意 brief 负责人。请把小红书帖子和评论区情绪转成给代理公司可执行的中文 brief。语气专业、具体、克制，说明品牌怎么接才不尴尬、哪些方向不要碰、风险和创意任务是什么；不要空泛口号，不要强行硬贴产品。"
     user_prompt = f"""
 请基于以下材料，生成更完整的 AI brief。
 
 {post_context(row, brand_name, campaign_name)}
+{sample_warning}
+
+请把输出写得像给代理公司开的策略任务，而不是泛泛总结；参考消费者原话必须来自材料，不足就说明不足。
 
 请严格使用以下 Markdown 结构输出：
 ## 背景观察
@@ -782,13 +839,20 @@ with st.sidebar:
     use_sample = st.checkbox("没有上传时使用示例春节洞察库", value=True)
 
     st.divider()
-    ai_config = get_ai_config()
+    ai_config = get_insight_model_config()
     st.subheader("AI 功能")
     st.caption(AI_COST_TIP)
+    provider_label = {"monica": "Monica", "aliyun": "阿里云百炼", "rule": "规则版"}.get(ai_config["provider"], "规则版")
+    st.markdown(f"**当前高级洞察模型：** {provider_label}")
+    st.caption(f"当前文本模型名：{ai_config.get('model') or '未启用文本模型'}")
+    st.caption(f"是否启用 Monica 洞察：{'是' if ai_config.get('use_monica') else '否'}")
+    if ai_config["provider"] == "monica":
+        st.warning("Monica API 会按模型和 token 单独计费，请注意用量。")
     if ai_config["available"]:
         st.success("AI 洞察增强已启用。")
     else:
-        st.info(AI_NOT_CONFIGURED_MESSAGE)
+        st.info(ai_config.get("disabled_reason") or AI_NOT_CONFIGURED_MESSAGE)
+    st.caption("推荐：阿里云视觉模型负责截图识别；Monica 文本模型负责高级洞察和 brief；Monica 未配置时回退到阿里云文本模型；全部不可用时继续使用规则版分析。")
 
     st.divider()
     st.subheader("如何使用")
@@ -1028,7 +1092,7 @@ with tab3:
             st.rerun()
 
         structured = st.session_state["screenshot_result"]["截图结构化识别"]
-        text_config = get_ai_config()
+        text_config = get_insight_model_config()
         if not text_config["available"]:
             st.info("未配置文本模型，当前无法基于确认内容生成 AI 洞察。")
 
@@ -1038,8 +1102,7 @@ with tab3:
                     insight_markdown = generate_confirmed_screenshot_insight(structured, screenshot_brand, screenshot_campaign, text_config)
                 st.session_state["screenshot_insight_markdown"] = insight_markdown
             except Exception as e:
-                st.error(TEXT_INSIGHT_ERROR_MESSAGE)
-                st.caption(str(e)[:500])
+                st.error(str(e) or TEXT_INSIGHT_ERROR_MESSAGE)
 
         if st.session_state.get("screenshot_insight_markdown"):
             st.markdown("### B. AI 洞察结果")
@@ -1098,8 +1161,7 @@ with tab4:
                     ai_insight_text = generate_ai_insight(selected, brand_name, campaign_name, ai_config)
                 st.session_state["ai_insight_text"] = ai_insight_text
             except Exception as e:
-                st.error(AI_ERROR_MESSAGE)
-                st.caption(str(e)[:500])
+                st.error(str(e) or AI_ERROR_MESSAGE)
 
         if st.session_state.get("ai_insight_text"):
             st.markdown(st.session_state["ai_insight_text"])
@@ -1163,8 +1225,7 @@ with tab6:
                     ai_brief_text = generate_ai_brief(selected_2, brand_name, campaign_name, ai_config)
                 st.session_state["ai_brief_text"] = ai_brief_text
             except Exception as e:
-                st.error(AI_ERROR_MESSAGE)
-                st.caption(str(e)[:500])
+                st.error(str(e) or AI_ERROR_MESSAGE)
 
         if st.session_state.get("ai_brief_text"):
             st.markdown(st.session_state["ai_brief_text"])
