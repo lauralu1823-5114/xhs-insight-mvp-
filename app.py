@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import re
 from io import BytesIO
@@ -21,10 +22,16 @@ st.set_page_config(
 )
 
 REQUIRED_COLUMNS = [
-    "编号", "搜索关键词", "内容链接", "笔记标题", "作者类型", "发布时间",
+    "编号", "搜索关键词", "内容链接", "笔记标题", "作者昵称", "作者类型", "发布时间",
+    "点赞数", "收藏数", "评论数", "分享数",
     "高赞评论摘录", "评论内赞量", "评论内互动量",
     "二创潜力", "二创方向", "品牌能否自然下场", "一句话洞察",
-    "截图识别备注"
+    "截图识别备注", "screenshot_post_id", "post_id"
+]
+
+POST_LEVEL_COLUMNS = [
+    "搜索关键词", "内容链接", "笔记标题", "作者昵称", "作者类型", "发布时间",
+    "点赞数", "收藏数", "评论数", "分享数", "截图识别备注"
 ]
 
 
@@ -335,6 +342,13 @@ def generate_confirmed_screenshot_insight(structured: dict, brand_name: str, cam
     system_prompt = "你是一位资深中国品牌策略同事。你只基于用户确认过的标题、正文、高赞评论和补充说明做判断；证据不足就明确说不足。请用中文输出，具体、克制、有取舍，不写空泛广告套话，不强行硬贴产品。"
     return call_ai_model(system_prompt, build_confirmed_screenshot_insight_prompt(structured, brand_name, campaign_name), config)
 
+def make_stable_post_id(prefix: str, *parts) -> str:
+    """用稳定哈希生成内部 post_id，避免不同来源的帖子被混在一起。"""
+    raw = "||".join(str(part or "").strip() for part in parts)
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+    return f"{prefix}_{digest}"
+
+
 def screenshot_result_to_dataframe(result: dict) -> pd.DataFrame:
     structured = result.get("截图结构化识别", {})
     comments = structured.get("高赞评论列表") or [{"评论文本": "", "点赞数": "", "评论者昵称": ""}]
@@ -345,10 +359,16 @@ def screenshot_result_to_dataframe(result: dict) -> pd.DataFrame:
         f"{structured.get('评论数', '')}评论" if structured.get("评论数") else "",
         f"{structured.get('分享数', '')}分享" if structured.get("分享数") else "",
     ]).strip()
+    screenshot_post_id = make_stable_post_id(
+        "screenshot",
+        structured.get("内容链接", ""),
+        structured.get("笔记标题", ""),
+        json.dumps(comments, ensure_ascii=False, sort_keys=True),
+    )
 
     for idx, comment in enumerate(comments):
         rows.append({
-            "编号": "截图识别" if idx == 0 else None,
+            "编号": f"截图识别-{screenshot_post_id}" if idx == 0 else None,
             "搜索关键词": structured.get("搜索关键词", "") if idx == 0 else None,
             "内容链接": structured.get("内容链接", "") if idx == 0 else None,
             "笔记标题": structured.get("笔记标题", "") if idx == 0 else None,
@@ -365,6 +385,8 @@ def screenshot_result_to_dataframe(result: dict) -> pd.DataFrame:
             "作者昵称": structured.get("作者昵称", "") if idx == 0 else None,
             "笔记正文": structured.get("笔记正文", "") if idx == 0 else None,
             "评论者昵称": comment.get("评论者昵称", "") if isinstance(comment, dict) else "",
+            "screenshot_post_id": screenshot_post_id,
+            "post_id": screenshot_post_id,
         })
     return pd.DataFrame(rows)
 
@@ -473,28 +495,43 @@ def extract_title_from_link_text(text) -> str:
     return raw.strip()
 
 
+def assign_post_ids(df: pd.DataFrame) -> pd.Series:
+    """按明确边界生成稳定 post_id，避免截图识别数据污染旧数据。"""
+    post_ids = []
+    current_post_id = None
+    for row_idx, row in df.iterrows():
+        if is_non_empty(row.get("post_id")):
+            current_post_id = str(row.get("post_id")).strip()
+        elif is_non_empty(row.get("screenshot_post_id")):
+            current_post_id = str(row.get("screenshot_post_id")).strip()
+        elif is_non_empty(row.get("编号")):
+            current_post_id = f"编号:{str(row.get('编号')).strip()}"
+        elif is_non_empty(row.get("内容链接")):
+            current_post_id = f"链接:{extract_url(row.get('内容链接')) or str(row.get('内容链接')).strip()}"
+        elif current_post_id is None:
+            current_post_id = f"row:{row_idx}"
+        post_ids.append(current_post_id)
+    return pd.Series(post_ids, index=df.index, dtype="string")
+
+
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
     清洗原始表格：
-    1. 自动识别一条新帖子
-    2. 评论行继承上方帖子信息
+    1. 基于编号 / 内容链接 / screenshot_post_id / 行号生成稳定 post_id
+    2. 帖子级字段只在同一个 post_id 内继承，禁止跨帖子全局填充
     3. 解析评论点赞数字
-    4. 自动补充标题和链接
+    4. 自动补充安全展示标题和链接
     """
     df = normalize_columns(df)
     df = df.copy()
 
     # 去掉全空行
     df = df.dropna(how="all").reset_index(drop=True)
+    df["post_id"] = assign_post_ids(df)
 
-    # 一条“新帖子”的判断：内容链接不空，或者编号不空
-    new_post_marker = df["内容链接"].apply(is_non_empty) | df["编号"].apply(is_non_empty)
-    df["post_id"] = new_post_marker.cumsum()
-
-    # 帖子级字段向下填充
-    post_cols = ["编号", "搜索关键词", "内容链接", "笔记标题", "作者类型", "发布时间"]
-    for col in post_cols:
-        df[col] = df.groupby("post_id")[col].ffill().bfill()
+    # 帖子级字段仅允许在同一 post_id 内从帖子首行向评论行继承；不做 bfill，避免旧空标题被后续截图标题污染。
+    for col in POST_LEVEL_COLUMNS:
+        df[col] = df.groupby("post_id", sort=False)[col].ffill()
 
     df["url"] = df["内容链接"].apply(extract_url)
     df["标题_clean"] = df["笔记标题"].where(df["笔记标题"].apply(is_non_empty), df["内容链接"].apply(extract_title_from_link_text))
@@ -606,6 +643,17 @@ def first_non_empty_value(series: pd.Series) -> str:
     return ""
 
 
+def make_post_display_label(row: pd.Series) -> str:
+    """下拉框使用安全 fallback，不借用其他帖子的标题。"""
+    title = str(row.get("笔记标题", "") or "").strip()
+    if title:
+        return title
+    url = str(row.get("内容链接", "") or "").strip()
+    if url:
+        return f"{url[:20]}…" if len(url) > 20 else url
+    return f"未命名笔记 #{row.get('post_id', '')}"
+
+
 def build_post_level_table(df: pd.DataFrame) -> pd.DataFrame:
     """把“多行评论”聚合成“每行一个帖子”。"""
     rows = []
@@ -636,7 +684,7 @@ def build_post_level_table(df: pd.DataFrame) -> pd.DataFrame:
         hot_score = note_likes + note_comments * 3 + comment_like_sum
 
         rows.append({
-            "post_id": int(post_id),
+            "post_id": str(post_id),
             "搜索关键词": keyword,
             "笔记标题": title,
             "内容链接": url,
@@ -659,6 +707,7 @@ def build_post_level_table(df: pd.DataFrame) -> pd.DataFrame:
     result = pd.DataFrame(rows)
     if not result.empty:
         result = result.sort_values("热度分", ascending=False).reset_index(drop=True)
+        result["帖子显示名"] = result.apply(make_post_display_label, axis=1)
     return result
 
 
@@ -1020,8 +1069,14 @@ with tab4:
     if post_df.empty:
         st.warning("暂无可分析数据。")
     else:
-        selected_title = st.selectbox("选择一篇帖子", post_df["笔记标题"].tolist())
-        selected = post_df[post_df["笔记标题"] == selected_title].iloc[0]
+        post_options = post_df.drop_duplicates("post_id").copy()
+        label_by_id = dict(zip(post_options["post_id"], post_options["帖子显示名"]))
+        selected_post_id = st.selectbox(
+            "选择一篇帖子",
+            post_options["post_id"].tolist(),
+            format_func=lambda pid: label_by_id.get(pid, str(pid)),
+        )
+        selected = post_options[post_options["post_id"] == selected_post_id].iloc[0]
 
         st.markdown(f"### {selected['洞察主题']}")
         st.write(f"**一句话洞察：** {selected['一句话洞察']}")
@@ -1077,8 +1132,15 @@ with tab6:
     if post_df.empty:
         st.warning("暂无可生成 brief 的数据。")
     else:
-        selected_title_2 = st.selectbox("选择要生成 brief 的帖子", post_df["笔记标题"].tolist(), key="brief_select")
-        selected_2 = post_df[post_df["笔记标题"] == selected_title_2].iloc[0]
+        brief_options = post_df.drop_duplicates("post_id").copy()
+        brief_label_by_id = dict(zip(brief_options["post_id"], brief_options["帖子显示名"]))
+        selected_post_id_2 = st.selectbox(
+            "选择要生成 brief 的帖子",
+            brief_options["post_id"].tolist(),
+            key="brief_select",
+            format_func=lambda pid: brief_label_by_id.get(pid, str(pid)),
+        )
+        selected_2 = brief_options[brief_options["post_id"] == selected_post_id_2].iloc[0]
         brief_text = generate_brief_text(selected_2, brand_name, campaign_name)
 
         st.text_area("可复制给自己/代理/ChatGPT继续精修", brief_text, height=520)
